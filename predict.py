@@ -1,17 +1,20 @@
-# single
-# CUDA_VISIBLE_DEVICES=2 python predict.py  --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --output_video --large_video
-# full
-# CUDA_VISIBLE_DEVICES=2 python predict.py --video_dir /home/code-server/NO3 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir /home/code-server/NO3/pred_result --eval_mode weight --output_video --large_video
+"""Run TrackNetV3 inference on one video or a folder of videos.
+
+Examples:
+    CUDA_VISIBLE_DEVICES=2 python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --output_video --large_video
+    CUDA_VISIBLE_DEVICES=2 python predict.py --video_dir /home/code-server/NO3 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir /home/code-server/NO3/pred_result --eval_mode weight --output_video --large_video
+"""
 
 import os
 import argparse
+import cv2
 import numpy as np
 from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader
 
-from test import predict_location, get_ensemble_weight, generate_inpaint_mask, predict_location_candidates, select_best_candidate,should_reset_track
+from test import get_ensemble_weight, generate_inpaint_mask, predict_location_candidates, select_best_candidate, should_reset_track
 from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
 from utils.general import *
 
@@ -25,7 +28,7 @@ def collect_video_files(video_dir):
     return video_files
 
 def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=None):
-    """ Predict coordinates from heatmap or inpainted coordinates. 
+    """ Predict coordinates from heatmap or inpainted coordinates.
 
         Args:
             indices (torch.Tensor): indices of input sequence with shape (N, L, 2)
@@ -47,22 +50,20 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
         }
 
     MAX_CANDIDATES = 3
-    MAX_DIST_TO_PRED = 110
-    MAX_DIST_TO_LAST = 150
     HISTORY_SIZE = 8
 
-    pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
+    pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': []}
 
     batch_size, seq_len = indices.shape[0], indices.shape[1]
-    indices = indices.detach().cpu().numpy()if torch.is_tensor(indices) else indices.numpy()
-    
-    # Transform input for heatmap prediction
+    indices = indices.detach().cpu().numpy() if torch.is_tensor(indices) else indices.numpy()
+
+    # Convert heatmap prediction to image format
     if y_pred is not None:
         y_pred = y_pred > 0.5
         y_pred = y_pred.detach().cpu().numpy() if torch.is_tensor(y_pred) else y_pred
-        y_pred = to_img_format(y_pred) # (N, L, H, W)
-    
-    # Transform input for coordinate prediction
+        y_pred = to_img_format(y_pred)  # (N, L, H, W)
+
+    # Convert coordinate prediction to numpy
     if c_pred is not None:
         c_pred = c_pred.detach().cpu().numpy() if torch.is_tensor(c_pred) else c_pred
 
@@ -72,11 +73,11 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
             f_i = indices[n][f][1]
             if f_i != prev_f_i:
                 if c_pred is not None:
-                    # Predict from coordinate
+                    # Predict from coordinates
                     c_p = c_pred[n][f]
-                    cx_pred, cy_pred = int(c_p[0] * WIDTH * img_scaler[0]), int(c_p[1] * HEIGHT* img_scaler[1]) 
+                    cx_pred, cy_pred = int(c_p[0] * WIDTH * img_scaler[0]), int(c_p[1] * HEIGHT * img_scaler[1])
                 elif y_pred is not None:
-                    # Predict from heatmap with multi-candidate selection + reset / reacquire
+                    # Predict from heatmap and choose the best candidate
                     y_p = y_pred[n][f]
                     heatmap = to_img(y_p)
 
@@ -85,7 +86,7 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
                         max_candidates=MAX_CANDIDATES,
                     )
 
-                    # heatmap 座標候選轉成原圖座標
+                    # Scale heatmap candidates back to the original video size
                     scaled_candidates = []
                     for c in candidates:
                         scaled_candidates.append({
@@ -105,13 +106,11 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
                         track_state["history"],
                         frame_w=frame_w,
                         frame_h=frame_h,
-                        miss_count=track_state["miss_count"],
                         border_margin=40,
                         stale_frames=6,
                         stale_avg_step_thresh=6.5,
                         stale_y_span_thresh=12.0,
                         stale_x_span_thresh=35.0,
-                        # debug=True,
                     )
 
                     if need_reset:
@@ -125,19 +124,17 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
                             f"last_valid={last_valid}"
                         )
 
-                        # 如果是桌上慢球，進入 ignore stale 模式
+                        # Ignore the previous stale ball for a short period
                         if reset_reason == "stale_ball" and last_valid is not None:
                             track_state["ignore_stale_until"] = int(f_i) + 80
                             track_state["ignore_stale_pos"] = last_valid
 
-                    # reset 的語意：上一顆球真的結束了
-                    allow_reacquire = need_reset
-
+                    # Reset means the previous ball has ended
                     select_history = [] if need_reset else track_state["history"]
                     select_miss_count = 0 if need_reset else track_state["miss_count"]
 
                     # --------------------------------------------------
-                    # 忽略已知桌上慢球附近的候選，避免一直重新抓到同一顆慢球
+                    # Avoid selecting candidates near the stale ball
                     # --------------------------------------------------
                     if (
                         track_state.get("ignore_stale_pos") is not None and
@@ -160,43 +157,33 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
 
                         scaled_candidates = filtered_candidates
 
-                    chosen = select_best_candidate(
-                        candidates=scaled_candidates,
-                        history=select_history,
-                        miss_count=select_miss_count,
-                        max_dist_to_pred=MAX_DIST_TO_PRED,
-                        max_dist_to_last=MAX_DIST_TO_LAST,
-                        reject_score=70,
-                        allow_reacquire=allow_reacquire,
-                        frame_idx=f_i,  # for debug
-                    )
+                    chosen = select_best_candidate(candidates=scaled_candidates, history=select_history, miss_count=select_miss_count)
 
                     if chosen is None:
                         cx_pred, cy_pred = 0, 0
 
                         if need_reset:
-                            # 舊球已結束，而且這一幀也還沒接到新球
-                            # 直接清空，等待下一顆球
+                            # The old ball ended, but the new ball has not appeared yet
                             track_state["history"] = []
                             track_state["miss_count"] = 0
                         else:
-                            # 同一顆球中間短 miss：不 reset，交給 select 之後接回
+                            # Short miss in the same trajectory
                             track_state["miss_count"] += 1
                             track_state["history"].append((0, 0, 0))
                     else:
                         cx_pred = int(chosen["cx"])
                         cy_pred = int(chosen["cy"])
 
-                        # 一旦接到新球，就解除 stale ignore
+                        # Once a new ball is found, stop ignoring the stale position
                         track_state["ignore_stale_until"] = -1
                         track_state["ignore_stale_pos"] = None
 
                         if need_reset:
-                            # reset 後接到新球：重開一條新 history
+                            # Start a new history after reset
                             track_state["history"] = [(cx_pred, cy_pred, 1)]
                             track_state["miss_count"] = 0
                         else:
-                            # 同一顆球正常延續
+                            # Continue the current trajectory
                             track_state["history"].append((cx_pred, cy_pred, 1))
                             track_state["miss_count"] = 0
 
@@ -212,8 +199,8 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), track_state=No
                 prev_f_i = f_i
             else:
                 break
-    
-    return pred_dict, track_state 
+
+    return pred_dict, track_state
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -252,7 +239,6 @@ if __name__ == '__main__':
     large_video = args.large_video
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
     print("device:", device)
 
     # Load model
@@ -282,8 +268,7 @@ if __name__ == '__main__':
         out_csv_file = os.path.join(save_subdir, f'{video_name}_ball.csv')
         out_video_file = os.path.join(save_subdir, f'{video_name}_predict.mp4')
 
-        if not os.path.exists(save_subdir):
-            os.makedirs(save_subdir)
+        os.makedirs(save_subdir, exist_ok=True)
 
         print('=' * 80)
         print('Processing:', video_file)
@@ -301,8 +286,8 @@ if __name__ == '__main__':
         w_scaler, h_scaler = w / WIDTH, h / HEIGHT
         img_scaler = (w_scaler, h_scaler)
 
-        tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Inpaint_Mask':[],
-                            'Img_scaler': (w_scaler, h_scaler), 'Img_shape': (w, h)}
+        tracknet_pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Inpaint_Mask': [],
+                              'Img_scaler': (w_scaler, h_scaler), 'Img_shape': (w, h)}
         track_state = {
             "history": [],
             "miss_count": 0,
@@ -310,23 +295,19 @@ if __name__ == '__main__':
             "ignore_stale_pos": None,
         }
 
-        # Test on TrackNet
+        # Run TrackNet
         tracknet.eval()
         seq_len = tracknet_seq_len
         if args.eval_mode == 'nonoverlap':
-            # Create dataset with non-overlap sampling
+            # Use non-overlap sampling
             if large_video:
                 dataset = Video_IterableDataset(video_file, seq_len=seq_len, sliding_step=seq_len, bg_mode=bg_mode,
                                                 max_sample_num=args.max_sample_num, video_range=video_range)
                 data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
                 print(f'Video length: {dataset.video_len}')
             else:
-                # Sample all frames from video
+                # Load all frames into memory
                 frame_list = generate_frames(video_file)
-                print("len(frame_list) =", len(frame_list))
-                print("type(frame_list[0]) =", type(frame_list[0]))
-                print("frame_list[0] =", frame_list[0] if isinstance(frame_list[0], str) else frame_list[0].shape)
-
                 dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=bg_mode,
                                                      frame_arr=np.array(frame_list)[:, :, :, ::-1], padding=True)
                 data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
@@ -337,35 +318,27 @@ if __name__ == '__main__':
                     y_pred = tracknet(x).detach().cpu()
 
                 # Predict
-                tmp_pred, track_state = predict(
-                    i,
-                    y_pred=y_pred,
-                    img_scaler=img_scaler,
-                    track_state=track_state,
-                )
+                tmp_pred, track_state = predict(i, y_pred=y_pred, img_scaler=img_scaler, track_state=track_state)
                 for key in tmp_pred.keys():
                     tracknet_pred_dict[key].extend(tmp_pred[key])
         else:
-            # Create dataset with overlap sampling for temporal ensemble
+            # Use overlap sampling for temporal ensemble
             if large_video:
                 dataset = Video_IterableDataset(video_file, seq_len=seq_len, sliding_step=1, bg_mode=bg_mode,
                                                 max_sample_num=args.max_sample_num, video_range=video_range)
                 data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
                 video_len = dataset.video_len
                 print(f'Video length: {video_len}')
-                
+
             else:
-                # Sample all frames from video
+                # Load all frames into memory
                 frame_list = generate_frames(video_file)
-                print("len(frame_list) =", len(frame_list))
-                print("type(frame_list[0]) =", type(frame_list[0]))
-                print("frame_list[0] =", frame_list[0] if isinstance(frame_list[0], str) else frame_list[0].shape)
                 dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='heatmap', bg_mode=bg_mode,
                                                      frame_arr=np.array(frame_list)[:, :, :, ::-1])
                 data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
                 video_len = len(frame_list)
-            
-            # Init prediction buffer params
+
+            # Initialize temporal ensemble buffers
             num_sample, sample_count = video_len-seq_len+1, 0
             buffer_size = seq_len - 1
             batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
@@ -377,54 +350,45 @@ if __name__ == '__main__':
                 b_size, seq_len = i.shape[0], i.shape[1]
                 with torch.no_grad():
                     y_pred = tracknet(x).detach().cpu()
-                
+
                 y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
                 ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
                 ensemble_y_pred = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
 
                 for b in range(b_size):
                     if sample_count < buffer_size:
-                        # Imcomplete buffer
+                        # Buffer is not full yet
                         y_pred = y_pred_buffer[batch_i+b, frame_i].sum(0) / (sample_count+1)
                     else:
-                        # General case
+                        # Normal weighted ensemble
                         y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
-                    
+
                     ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
                     ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
                     sample_count += 1
 
                     if sample_count == num_sample:
-                        # Last batch
+                        # Flush remaining frames in the last batch
                         y_zero_pad = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
                         y_pred_buffer = torch.cat((y_pred_buffer, y_zero_pad), dim=0)
 
                         for f in range(1, seq_len):
-                            # Last input sequence
+                            # Flush remaining frames in the last sequence
                             y_pred = y_pred_buffer[batch_i+b+f, frame_i].sum(0) / (seq_len-f)
                             ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
                             ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
 
                 # Predict
-                tmp_pred, track_state  = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler,track_state=track_state)
+                tmp_pred, track_state = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler, track_state=track_state)
                 for key in tmp_pred.keys():
                     tracknet_pred_dict[key].extend(tmp_pred[key])
 
-                # Update buffer, keep last predictions for ensemble in next iteration
+                # Keep the last predictions for the next ensemble window
                 y_pred_buffer = y_pred_buffer[-buffer_size:]
-
-        #assert video_len == len(tracknet_pred_dict['Frame']), 'Prediction length mismatch'
-        # Test on TrackNetV3 (TrackNet + InpaintNet)
+        # Run TrackNetV3 (TrackNet + InpaintNet)
         if inpaintnet is not None:
             inpaintnet.eval()
             seq_len = inpaintnet_seq_len
-            '''tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(
-                tracknet_pred_dict,
-                frame_w=w,
-                frame_h=h,
-                max_gap=12,        
-                border_margin=12,
-            )'''
             tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(
                 tracknet_pred_dict,
                 frame_w=w,
@@ -436,10 +400,10 @@ if __name__ == '__main__':
                 angle_check_min_gap=14,
             )
 
-            inpaint_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
+            inpaint_pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': []}
 
             if args.eval_mode == 'nonoverlap':
-                # Create dataset with non-overlap sampling
+                # Use non-overlap sampling
                 dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='coordinate', pred_dict=tracknet_pred_dict, padding=True)
                 data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
 
@@ -447,19 +411,19 @@ if __name__ == '__main__':
                     coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
                     with torch.no_grad():
                         coor_inpaint = inpaintnet(coor_pred.to(device), inpaint_mask.to(device)).detach().cpu()
-                        coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
-                    
-                    # Thresholding
+                        coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # Replace missing coordinates with inpainted coordinates
+
+                    # Remove near-zero coordinate predictions
                     th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
                     coor_inpaint[th_mask] = 0.
-                    
+
                     # Predict
-                    tmp_pred,_  = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler,)
+                    tmp_pred, _ = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler)
                     for key in tmp_pred.keys():
                         inpaint_pred_dict[key].extend(tmp_pred[key])
-                    
+
             else:
-                # Create dataset with overlap sampling for temporal ensemble
+                # Use overlap sampling for temporal ensemble
                 dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode='coordinate', pred_dict=tracknet_pred_dict)
                 data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
                 weight = get_ensemble_weight(seq_len, args.eval_mode)
@@ -470,60 +434,60 @@ if __name__ == '__main__':
                 batch_i = torch.arange(seq_len) # [0, 1, 2, 3, 4, 5, 6, 7]
                 frame_i = torch.arange(seq_len-1, -1, -1) # [7, 6, 5, 4, 3, 2, 1, 0]
                 coor_inpaint_buffer = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-                
+
                 for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
                     coor_pred, inpaint_mask = coor_pred.float(), inpaint_mask.float()
                     b_size = i.shape[0]
                     with torch.no_grad():
                         coor_inpaint = inpaintnet(coor_pred.to(device), inpaint_mask.to(device)).detach().cpu()
                         coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask)
-                    
-                    # Thresholding
+
+                    # Remove near-zero coordinate predictions
                     th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
                     coor_inpaint[th_mask] = 0.
 
                     coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_inpaint), dim=0)
                     ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
                     ensemble_coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
-                    
+
                     for b in range(b_size):
                         if sample_count < buffer_size:
-                            # Imcomplete buffer
+                            # Buffer is not full yet
                             coor_inpaint = coor_inpaint_buffer[batch_i+b, frame_i].sum(0)
                             coor_inpaint /= (sample_count+1)
                         else:
-                            # General case
+                            # Normal weighted ensemble
                             coor_inpaint = (coor_inpaint_buffer[batch_i+b, frame_i] * weight[:, None]).sum(0)
-                        
+
                         ensemble_i = torch.cat((ensemble_i, i[b][0].view(1, 1, 2)), dim=0)
                         ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
                         sample_count += 1
 
                         if sample_count == num_sample:
-                            # Last input sequence
+                            # Flush remaining frames in the last sequence
                             coor_zero_pad = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
                             coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_zero_pad), dim=0)
-                            
+
                             for f in range(1, seq_len):
                                 coor_inpaint = coor_inpaint_buffer[batch_i+b+f, frame_i].sum(0)
                                 coor_inpaint /= (seq_len-f)
                                 ensemble_i = torch.cat((ensemble_i, i[-1][f].view(1, 1, 2)), dim=0)
                                 ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
 
-                    # Thresholding
+                    # Remove near-zero coordinate predictions
                     th_mask = ((ensemble_coor_inpaint[:, :, 0] < COOR_TH) & (ensemble_coor_inpaint[:, :, 1] < COOR_TH))
                     ensemble_coor_inpaint[th_mask] = 0.
 
                     # Predict
-                    tmp_pred, _  = predict(ensemble_i, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler)
+                    tmp_pred, _ = predict(ensemble_i, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler)
                     for key in tmp_pred.keys():
                         inpaint_pred_dict[key].extend(tmp_pred[key])
-                    
-                    # Update buffer, keep last predictions for ensemble in next iteration
-                    coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
-            
 
-        # Write csv file
+                    # Keep the last predictions for the next ensemble window
+                    coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
+
+
+        # Save prediction CSV
         pred_dict = inpaint_pred_dict if inpaintnet is not None else tracknet_pred_dict
 
         if 'Inpaint_Mask' not in pred_dict:
@@ -534,7 +498,7 @@ if __name__ == '__main__':
 
         write_pred_csv(pred_dict, save_file=out_csv_file)
 
-        # Write video with predicted coordinates
+        # Save visualization video
         if args.output_video:
             write_pred_video(video_file, pred_dict, save_file=out_video_file, traj_len=args.traj_len)
 

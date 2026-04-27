@@ -16,11 +16,9 @@ from dataset import Shuttlecock_Trajectory_Dataset, data_dir
 from utils.general import *
 from utils.metric import *
 
-
 pred_types = ['TP', 'TN', 'FP1', 'FP2', 'FN']
 pred_types_map = {pred_type: i for i, pred_type in enumerate(pred_types)}
 inpaintnet_eval_types = ['inpaint', 'reconstruct', 'baseline']
-
 
 def get_ensemble_weight(seq_len, eval_mode):
     """ Get weight for temporal ensemble.
@@ -31,7 +29,7 @@ def get_ensemble_weight(seq_len, eval_mode):
                 Choices:
                     - 'average': Return uniform weight
                     - 'weight': Return positional weight
-        
+
         Returns:
             weight (torch.Tensor): Weight for temporal ensemble
     """
@@ -40,22 +38,20 @@ def get_ensemble_weight(seq_len, eval_mode):
         weight = torch.ones(seq_len) / seq_len
     elif eval_mode == 'weight':
         weight = torch.ones(seq_len)
-        for i in range(math.ceil(seq_len/2)):
+        for i in range(math.ceil(seq_len / 2)):
             weight[i] = (i+1)
-            weight[seq_len-i-1] = (i+1)
+            weight[seq_len - i - 1] = (i+1)
         weight = weight / weight.sum()
     else:
         raise ValueError('Invalid mode')
-    
+
     return weight
 
 def should_reset_track(
     history,
     frame_w,
     frame_h,
-    miss_count=0,   # 保留介面，但不再拿來直接 reset
     border_margin=40,
-    max_stale_miss=2,   # 保留介面，不使用
     stale_frames=6,
     stale_avg_step_thresh=6.5,
     stale_y_span_thresh=12.0,
@@ -72,12 +68,12 @@ def should_reset_track(
     """
     valid_history = [(x, y) for (x, y, vis) in history if vis == 1]
 
-    # 沒有足夠 valid history，就不要 reset
+    # Do not reset without enough valid history.
     if len(valid_history) < 2:
         return False, None
 
     # --------------------------------------------------
-    # 1) 明確出畫面：靠近邊界且往外移動
+    # Reset when the ball is near the border and moving outward.
     # --------------------------------------------------
     x1, y1 = valid_history[-2]
     x2, y2 = valid_history[-1]
@@ -103,7 +99,7 @@ def should_reset_track(
         return True, "border_out"
 
     # --------------------------------------------------
-    # 2) 殘留慢速球：最近幾幀幾乎停住
+    # Reset stale balls that barely move for several frames.
     # --------------------------------------------------
     if len(valid_history) >= stale_frames:
         recent = valid_history[-stale_frames:]
@@ -171,103 +167,39 @@ def predict_location_candidates(heatmap, max_candidates=3, min_area=1):
     candidates.sort(key=lambda c: c["area"], reverse=True)
     return candidates[:max_candidates]
 
-
 def select_best_candidate(
     candidates,
     history,
     miss_count=0,
-    max_dist_to_pred=140.0,   # 保留介面，不當主要判斷
-    max_dist_to_last=180.0,   # 保留介面，不當主要判斷
-    area_bonus_weight=0.10,   # 保留介面，不使用
     min_area_no_history=6.0,
     min_area_with_history=2.0,
-    reject_score=85.0,        # 保留介面，不使用
-    allow_reacquire=False,    # 保留介面，不使用
-    frame_w=None,
-    frame_h=None,
     min_y=350,
     max_y=900,
-    frame_idx=None,  # for debug
-    debug_start=4485,
-    debug_end=4500,
+    debug=False,
 ):
-    debug_on = (
-        frame_idx is not None and
-        debug_start <= frame_idx <= debug_end
-    )
-
-    if debug_on:
-        print("\n" + "=" * 80)
-        print(
-            f"[select] frame={frame_idx}, miss_count={miss_count}, "
-            f"raw_candidates={len(candidates)}"
-        )
+    """Select the most reasonable ball candidate from one heatmap frame."""
+    if debug:
+        print(f"[select] miss_count={miss_count}, raw_candidates={len(candidates)}")
 
     if not candidates:
-        if debug_on:
-            print("[select] no candidates -> return None")
         return None
 
-    # --------------------------------------------------
-    # 1) 基本過濾：只保留合理 y 範圍
-    # --------------------------------------------------
     candidates = [c for c in candidates if min_y <= c["cy"] <= max_y]
-
-    if debug_on:
+    if debug:
         print(f"[select] after_y_filter={len(candidates)}")
-        for i, c in enumerate(candidates):
-            print(
-                f"  [cand {i}] cx={c['cx']}, cy={c['cy']}, area={c['area']}"
-            )
 
     if not candidates:
-        if debug_on:
-            print("[select] no candidates after y filter -> return None")
         return None
 
     valid_history = [(x, y) for (x, y, vis) in history if vis == 1]
 
-    if debug_on:
-        print(f"[select] valid_history_len={len(valid_history)}")
-        if len(valid_history) > 0:
-            print(f"[select] last_valid={valid_history[-1]}")
-        if len(valid_history) > 1:
-            print(f"[select] prev_valid={valid_history[-2]}")
-
-    # --------------------------------------------------
-    # 2) 沒有 history：就是新段，直接用 no-history 挑法
-    # --------------------------------------------------
     if not valid_history:
-        valid_candidates = []
-        for i, c in enumerate(candidates):
-            area = c["area"]
-            if area < min_area_no_history:
-                if debug_on:
-                    print(f"  [cand {i}] reject: area too small")
-                continue
-            valid_candidates.append(c)
-
+        valid_candidates = [c for c in candidates if c["area"] >= min_area_no_history]
         if not valid_candidates:
-            if debug_on:
-                print("[select] no valid candidate -> return None")
             return None
+        return max(valid_candidates, key=lambda c: c["area"])
 
-        # 不再偏畫面中心，直接選 area 最大
-        best_c = max(valid_candidates, key=lambda c: c["area"])
-
-        if debug_on:
-            print(
-                f"[select] best(no_history)=({best_c['cx']},{best_c['cy']}), "
-                f"area={best_c['area']:.2f}"
-            )
-        return best_c
-
-    # --------------------------------------------------
-    # 3) 有 history：一律當作同一顆球延續
-    # miss_count 只用來放寬 x gap，不再切模式
-    # --------------------------------------------------
     last_x, last_y = valid_history[-1]
-
     if len(valid_history) >= 2:
         prev_x, prev_y = valid_history[-2]
         hist_dx = last_x - prev_x
@@ -276,30 +208,19 @@ def select_best_candidate(
         hist_dx = 0.0
         hist_dy = 0.0
 
-    if debug_on:
-        print(
-            f"[select] last_x={last_x}, last_y={last_y}, hist_dx={hist_dx:.2f}"
-        )
-
-    valid_candidates = []
-
-    # miss 越多，只放寬 x 門檻；不切成另一套邏輯
     if miss_count == 0:
         max_x_gap = 130.0
     elif miss_count <= 3:
         max_x_gap = 350.0
     else:
-        max_x_gap = 550
+        max_x_gap = 550.0
 
-    for i, c in enumerate(candidates):
+    valid_candidates = []
+    for c in candidates:
         cx, cy = c["cx"], c["cy"]
         area = c["area"]
 
         if area < min_area_with_history:
-            if debug_on:
-                print(
-                    f"  [cand {i}] reject: area {area:.2f} < {min_area_with_history:.2f}"
-                )
             continue
 
         dx = cx - last_x
@@ -312,49 +233,17 @@ def select_best_candidate(
         y_to_pred = abs(cy - pred_y)
 
         if y_to_last > 100:
-            if debug_on:
-                print(
-                    f"  [cand {i}] reject: y gap too large "
-                    f"(y_to_last={y_to_last:.2f})"
-                )
             continue
 
-        # 核心：前一顆差太遠就不要選
         if x_to_last > max_x_gap:
-            if debug_on:
-                print(
-                    f"  [cand {i}] reject: x gap too large "
-                    f"(x_to_last={x_to_last:.2f}, max_x_gap={max_x_gap:.2f})"
-                )
             continue
 
-        # 方向一致性只在完全連續追蹤時才用
-        # miss 後不要太早把正確候選擋掉
         if len(valid_history) >= 2 and miss_count == 0:
             if hist_dx > 12 and dx < -12:
-                if debug_on:
-                    print(
-                        f"  [cand {i}] reject: opposite x direction "
-                        f"(hist_dx={hist_dx:.2f}, cand_dx={dx:.2f})"
-                    )
                 continue
-
             if hist_dx < -12 and dx > 12:
-                if debug_on:
-                    print(
-                        f"  [cand {i}] reject: opposite x direction "
-                        f"(hist_dx={hist_dx:.2f}, cand_dx={dx:.2f})"
-                    )
                 continue
-
-        # 交會保護：連續追蹤時，候選要接近預測軌跡
-        if len(valid_history) >= 2 and miss_count == 0:
             if x_to_pred > 120 or y_to_pred > 80:
-                if debug_on:
-                    print(
-                        f"  [cand {i}] reject: too far from predicted path "
-                        f"(x_to_pred={x_to_pred:.2f}, y_to_pred={y_to_pred:.2f})"
-                    )
                 continue
 
         valid_candidates.append({
@@ -365,20 +254,9 @@ def select_best_candidate(
             "area": area,
         })
 
-        if debug_on:
-            print(
-                f"  [cand {i}] keep: cx={cx}, cy={cy}, area={area:.2f}, "
-                f"x_to_last={x_to_last:.2f}"
-            )
-
     if not valid_candidates:
-        if debug_on:
-            print("[select] no valid candidate -> return None")
         return None
 
-    # --------------------------------------------------
-    # 4) 最後只在通過條件的候選中挑最近那顆
-    # --------------------------------------------------
     best = min(
         valid_candidates,
         key=lambda item: (
@@ -389,17 +267,7 @@ def select_best_candidate(
         )
     )
 
-    best_c = best["cand"]
-
-    if debug_on:
-        print(
-            f"[select] best=({best_c['cx']},{best_c['cy']}), "
-            f"x_last={best['x_to_last']:.2f}, "
-            f"area={best['area']:.2f}"
-        )
-
-    return best_c
-
+    return best["cand"]
 
 def predict_location(heatmap):
     """ Get coordinates from the heatmap.
@@ -442,13 +310,13 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
             tolerance (float) - Tolerance for FP1
             img_scaler (Tuple[float, float]) - Scaler of input image size to original image size
             output_bbox (bool) - Whether to output detection result
-        
+
         Returns:
             pred_dict (Dict) - Prediction result
                 Format: {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[], 'BBox': [], 'Confidence':[]}}
     """
-    
-    pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[], 'BBox': [], 'Confidence':[], 'X_GT':[], 'Y_GT':[], 'Visibility_GT':[]}
+
+    pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Type': [], 'BBox': [], 'Confidence': [], 'X_GT': [], 'Y_GT': [], 'Visibility_GT': []}
 
     batch_size, seq_len = indices.shape[0], indices.shape[1]
     indices = indices.detach().cpu().numpy().tolist() if torch.is_tensor(indices) else indices.numpy().tolist()
@@ -461,7 +329,7 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
         y_true = to_img_format(y_true) # (N, L, H, W)
         y_pred = to_img_format(y_pred) # (N, L, H, W)
         h_pred = y_pred > 0.5
-    
+
     # Transform input for coordinate prediction
     if c_true is not None and c_pred is not None:
         assert y_true is None and y_pred is None, 'Invalid input'
@@ -556,7 +424,7 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
                     pred_dict['X_GT'].append(int(cx_true*img_scaler[0]))
                     pred_dict['Y_GT'].append(int(cy_true*img_scaler[1]))
                     pred_dict['Visibility_GT'].append(vis_gt)
-                
+
                 prev_d_i = d_i
             else:
                 break
@@ -569,9 +437,8 @@ def evaluate(indices, y_true=None, y_pred=None, c_true=None, c_pred=None, tolera
         del pred_dict['X_GT']
         del pred_dict['Y_GT']
         del pred_dict['Visibility_GT']
-    
-    return pred_dict
 
+    return pred_dict
 
 def generate_inpaint_mask(
     pred_dict,
@@ -679,7 +546,7 @@ def generate_inpaint_mask(
         if count_visible_forward(next_idx) < min_valid_run:
             continue
 
-        # 短 gap 維持原本：直接補
+        # Short gaps are safe to inpaint directly.
         if gap_len < angle_check_min_gap:
             mask[start:end] = 1
             continue
@@ -691,7 +558,7 @@ def generate_inpaint_mask(
             dx_before = x[prev_idx] - x[prev2_idx]
             dx_after = x[next2_idx] - x[next_idx]
 
-            # 只有較長 gap 才擋明顯反轉
+            # For longer gaps, reject obvious x-direction reversal.
             if dx_before < -max_reverse_dx and dx_after > max_reverse_dx:
                 continue
             if dx_before > max_reverse_dx and dx_after < -max_reverse_dx:
@@ -743,7 +610,7 @@ def linear_interp(target, inpaint_mask):
                 fp = [target[i-1], target[j]]
             target[i:j] = np.interp(x, xp, fp)
         i = j
-    
+
     return target
 
 # Only for training evaluation, won't save the result
@@ -753,7 +620,7 @@ def get_eval_res(pred_dict):
         Args:
             pred_dict (Dict): Prediction result
                 Format: {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
-        
+
         Returns:
             res (numpy.ndarray): Evaluation result
                 Format: np.array([TP, TN, FP1, FP2, FN])
@@ -775,7 +642,7 @@ def eval_tracknet(model, data_loader, param_dict):
             param_dict (Dict): Parameters
                 param_dict['verbose'] (bool): Whether to show progress bar
                 param_dict['tolerance'] (int): Tolerance for FP1
-            
+
         Returns:
             (float): Average loss
             res_dict (Dict): Evaluation result
@@ -795,7 +662,7 @@ def eval_tracknet(model, data_loader, param_dict):
         data_prob = tqdm(data_loader)
     else:
         data_prob = data_loader
-    
+
     for step, (i, x, y, _, _) in enumerate(data_prob):
         x, y = x.float().cuda(), y.float().cuda()
         with torch.no_grad():
@@ -806,12 +673,12 @@ def eval_tracknet(model, data_loader, param_dict):
 
         pred_dict = evaluate(i, y_true=y, y_pred=y_pred, tolerance=param_dict['tolerance'])
         confusion_matrix += get_eval_res(pred_dict)
-        
+
         if param_dict['verbose']:
             TP, TN, FP1, FP2, FN = confusion_matrix
             data_prob.set_description(f'Evaluation')
             data_prob.set_postfix(TP=TP, TN=TN, FP1=FP1, FP2=FP2, FN=FN)
-    
+
     TP, TN, FP1, FP2, FN = confusion_matrix
     accuracy, precision, recall, f1, miss_rate = get_metric(TP, TN, FP1, FP2, FN)
     res_dict = {'TP': TP, 'TN': TN,
@@ -821,7 +688,7 @@ def eval_tracknet(model, data_loader, param_dict):
                 'recall': recall,
                 'f1': f1,
                 'miss_rate': miss_rate}
-    
+
     return float(np.mean(losses)), res_dict
 
 def eval_inpaintnet(model, data_loader, param_dict):
@@ -833,7 +700,7 @@ def eval_inpaintnet(model, data_loader, param_dict):
             param_dict (Dict): Parameters
                 param_dict['verbose'] (bool): Whether to show progress bar
                 param_dict['tolerance'] (int): Tolerance for FP1
-            
+
         Returns:
             (float): Average loss
             res_dict (Dict): Evaluation result
@@ -856,18 +723,18 @@ def eval_inpaintnet(model, data_loader, param_dict):
 
     for step, (i, coor_pred, coor, _, _, inpaint_mask) in enumerate(data_prob):
         coor_pred, coor, inpaint_mask = coor_pred.float().cuda(), coor.float().cuda(), inpaint_mask.float().cuda()
-        
+
         with torch.no_grad():
             coor_inpaint = model(coor_pred, inpaint_mask)
-            coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask)
-            
+            coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1 - inpaint_mask)
+
             loss = nn.MSELoss()(coor_inpaint * inpaint_mask, coor * inpaint_mask)
             losses.append(loss.item())
 
             # Thresholding
             th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
             coor_inpaint[th_mask] = 0.
-        
+
         for eval_type in inpaintnet_eval_types:
             if eval_type == 'inpaint':
                 pred_dict = evaluate(i, c_true=coor, c_pred=coor_inpaint, tolerance=param_dict['tolerance'])
@@ -878,12 +745,12 @@ def eval_inpaintnet(model, data_loader, param_dict):
             else:
                 raise ValueError('Invalid eval_type')
             confusion_matrix[eval_type] += get_eval_res(pred_dict)
-        
+
         if param_dict['verbose']:
             TP, TN, FP1, FP2, FN = confusion_matrix['inpaint']
             data_prob.set_description(f'Evaluation')
             data_prob.set_postfix(TP=TP, TN=TN, FP1=FP1, FP2=FP2, FN=FN)
-    
+
     res_dict = {}
     for eval_type in inpaintnet_eval_types:
         TP, TN, FP1, FP2, FN = confusion_matrix[eval_type]
@@ -895,7 +762,7 @@ def eval_inpaintnet(model, data_loader, param_dict):
                                'recall': recall,
                                'f1': f1,
                                'miss_rate': miss_rate}
-    
+
     return float(np.mean(losses)), res_dict
 
 # For testing evaluation
@@ -919,7 +786,7 @@ def get_coco_res(pred_dict, drop=False):
             start_f, end_f = drop_frame_dict['start'], drop_frame_dict['end']
             for key in pred.keys():
                 pred[key] = pred[key][start_f[rally_key]:end_f[rally_key]]
-        
+
         for i in range(len(pred['Frame'])):
             if pred['Visibility'][i] > 0:
                 res_list.append({'id': sample_count,
@@ -932,7 +799,7 @@ def get_coco_res(pred_dict, drop=False):
                                  'segmentation': [],
                                  'iscrowd': 0})
             sample_count += 1
-    
+
     return res_list
 
 def get_test_res(pred_dict, drop=False):
@@ -962,11 +829,11 @@ def get_test_res(pred_dict, drop=False):
             type_res = np.array(pred['Type'])[start_f[rally_key]:end_f[rally_key]]
         else:
             type_res = np.array(pred['Type'])
-        
+
         # Calculate metrics
         for pred_type in pred_types:
             res_dict[pred_type] += int((type_res == pred_types_map[pred_type]).sum())
-    
+
     TP, TN, FP1, FP2, FN = res_dict['TP'], res_dict['TN'], res_dict['FP1'], res_dict['FP2'], res_dict['FN']
     accuracy, precision, recall, f1, miss_rate = get_metric(TP, TN, FP1, FP2, FN)
     res_dict = {'TP': TP, 'TN': TN,
@@ -976,7 +843,7 @@ def get_test_res(pred_dict, drop=False):
                 'recall': recall,
                 'f1': f1,
                 'miss_rate': miss_rate}
-    
+
     return res_dict
 
 def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False):
@@ -1008,7 +875,7 @@ def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False)
     rally_dirs = [os.path.join(data_dir, rally_dir) for rally_dir in rally_dirs]
     if param_dict['debug']:
         rally_dirs = rally_dirs[:1]
-    
+
     for rally_dir in rally_dirs:
         # Parse rally directory to form rally key
         file_format_str = os.path.join('{}', 'frame', '{}')
@@ -1026,9 +893,9 @@ def test(model, split, param_dict, save_inpaint_mask=False, linear_interp=False)
         if save_inpaint_mask:
             if not os.path.exists(os.path.join(match_dir, 'predicted_csv')):
                 os.makedirs(os.path.join(match_dir, 'predicted_csv'))
-            csv_file = os.path.join(match_dir, 'predicted_csv',f'{rally_id}_ball.csv')
+            csv_file = os.path.join(match_dir, 'predicted_csv', f'{rally_id}_ball.csv')
             write_pred_csv(tmp_pred, save_file=csv_file, save_inpaint_mask=save_inpaint_mask)
-    
+
     return pred_dict
 
 def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
@@ -1068,25 +935,21 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
     if inpaintnet is None:
         tracknet.eval()
         seq_len = param_dict['tracknet_seq_len']
-        tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[], 'BBox': [], 'Confidence':[], 'X_GT':[], 'Y_GT':[], 'Visibility_GT':[]}
+        tracknet_pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Type': [], 'BBox': [], 'Confidence': [], 'X_GT': [], 'Y_GT': [], 'Visibility_GT': []}
 
         if param_dict['eval_mode'] == 'nonoverlap':
             # Create dataset with non-overlap sampling
             dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=param_dict['bg_mode'], rally_dir=rally_dir, padding=True)
             data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-            
+
             data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
             for step, (i, x, y, _, _) in enumerate(data_prob):
                 x = x.float().cuda()
                 with torch.no_grad():
                     y_pred = tracknet(x).detach().cpu()
-                
+
                 # Predict
-                tmp_pred = evaluate(i, y_true=y, y_pred=y_pred,
-                                    tolerance=param_dict['tolerance'],
-                                    img_scaler=(w_scaler, h_scaler),
-                                    output_bbox=param_dict['output_bbox'],
-                                    output_gt=param_dict['output_gt'])
+                tmp_pred = evaluate(i, y_true=y, y_pred=y_pred, tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler), output_bbox=param_dict['output_bbox'], output_gt=param_dict['output_gt'])
                 for key in tmp_pred.keys():
                     tracknet_pred_dict[key].extend(tmp_pred[key])
         else:
@@ -1108,7 +971,7 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                 b_size, seq_len = i.shape[0], i.shape[1]
                 with torch.no_grad():
                     y_pred = tracknet(x).detach().cpu()
-                
+
                 y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
                 ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
                 ensemble_y = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
@@ -1122,7 +985,7 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                     else:
                         # General case
                         y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
-                        
+
                     ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
                     ensemble_y = torch.cat((ensemble_y, y[b][0].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
                     ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
@@ -1139,20 +1002,16 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                             ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
                             ensemble_y = torch.cat((ensemble_y, y[-1][f].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
                             ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                        
+
                 # Predict
-                tmp_pred = evaluate(ensemble_i, y_true=ensemble_y, y_pred=ensemble_y_pred,
-                                    tolerance=param_dict['tolerance'],
-                                    img_scaler=(w_scaler, h_scaler),
-                                    output_bbox=param_dict['output_bbox'],
-                                    output_gt=param_dict['output_gt'])
+                tmp_pred = evaluate(ensemble_i, y_true=ensemble_y, y_pred=ensemble_y_pred, tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler), output_bbox=param_dict['output_bbox'], output_gt=param_dict['output_gt'])
                 for key in tmp_pred.keys():
                     tracknet_pred_dict[key].extend(tmp_pred[key])
 
                 # Update buffer, keep last predictions for ensemble in next iteration
                 y_pred_buffer = y_pred_buffer[-buffer_size:]
-        
-        # tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=30)
+
+        # tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, frame_w=w, frame_h=h, max_gap=10, border_margin_x=160, max_angle_diff=100.0, min_valid_run=1, angle_check_min_gap=8)
         tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(
             tracknet_pred_dict,
             frame_w=w,
@@ -1168,7 +1027,7 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
         # Test on TrackNetV3 (TrackNet + InpaintNet)
         inpaintnet.eval()
         seq_len = param_dict['inpaintnet_seq_len']
-        inpaintnet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
+        inpaintnet_pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Type': []}
 
         if param_dict['eval_mode'] == 'nonoverlap':
             # Create dataset with non-overlap sampling
@@ -1180,12 +1039,12 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                 coor_pred, coor, inpaint_mask = coor_pred.float(), coor.float(), inpaint_mask.float()
                 with torch.no_grad():
                     coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
-                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1-inpaint_mask) # replace predicted coordinates with inpainted coordinates
-                
+                    coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1 - inpaint_mask) # replace predicted coordinates with inpainted coordinates
+
                 # Thresholding
                 th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
                 coor_inpaint[th_mask] = 0.
-                
+
                 # Predict
                 tmp_pred = evaluate(i, c_true=coor, c_pred=coor_inpaint, tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler))
                 for key in tmp_pred.keys():
@@ -1210,7 +1069,7 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                 with torch.no_grad():
                     coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
                     coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1 - inpaint_mask) # replace predicted coordinates with inpainted coordinates
-                
+
                 # Thresholding
                 th_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
                 coor_inpaint[th_mask] = 0.
@@ -1219,33 +1078,33 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                 ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
                 ensemble_coor = torch.empty((0, 1, 2), dtype=torch.float32)
                 ensemble_coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
-                
+
                 for b in range(b_size):
                     if sample_count < buffer_size:
                         # Imcomplete buffer
                         coor_inpaint = coor_inpaint_buffer[batch_i+b, frame_i].sum(0)
-                        coor_inpaint /= (sample_count+1)  
+                        coor_inpaint /= (sample_count+1)
                     else:
                         # General case
                         coor_inpaint = (coor_inpaint_buffer[batch_i+b, frame_i] * weight[:, None]).sum(0)
-                    
+
                     ensemble_i = torch.cat((ensemble_i, i[b][0].view(1, 1, 2)), dim=0)
                     ensemble_coor = torch.cat((ensemble_coor, coor[b][0].view(1, 1, 2)), dim=0)
                     ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
                     sample_count += 1
-                
+
                     if sample_count == num_sample:
                         # Last input sequence
                         coor_zero_pad = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
                         coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_zero_pad), dim=0)
-                        
+
                         for f in range(1, seq_len):
                             coor_inpaint = coor_inpaint_buffer[batch_i+b+f, frame_i].sum(0)
                             coor_inpaint /= (seq_len-f)
                             ensemble_i = torch.cat((ensemble_i, i[b][f].view(1, 1, 2)), dim=0)
                             ensemble_coor = torch.cat((ensemble_coor, coor[b][f].view(1, 1, 2)), dim=0)
                             ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, coor_inpaint.view(1, 1, 2)), dim=0)
-                
+
                 # Thresholding
                 th_mask = ((ensemble_coor_inpaint[:, :, 0] < COOR_TH) & (ensemble_coor_inpaint[:, :, 1] < COOR_TH))
                 ensemble_coor_inpaint[th_mask] = 0.
@@ -1261,7 +1120,7 @@ def test_rally(model, rally_dir, param_dict, save_inpaint_mask=False):
                 coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
 
         return inpaintnet_pred_dict
-        
+
 def test_rally_linear(model, rally_dir, param_dict):
     tracknet, _ = model
     w, h = Image.open(os.path.join(rally_dir, '0.jpg')).size
@@ -1270,19 +1129,19 @@ def test_rally_linear(model, rally_dir, param_dict):
     # Test on TrackNet
     tracknet.eval()
     seq_len = param_dict['tracknet_seq_len']
-    tracknet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
+    tracknet_pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Type': []}
 
     if param_dict['eval_mode'] == 'nonoverlap':
         # Create dataset with non-overlap sampling
         dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=seq_len, data_mode='heatmap', bg_mode=param_dict['bg_mode'], rally_dir=rally_dir, padding=True)
         data_loader = DataLoader(dataset, batch_size=param_dict['batch_size'], shuffle=False, num_workers=param_dict['num_workers'], drop_last=False)
-        
+
         data_prob = tqdm(data_loader) if param_dict['verbose'] else data_loader
         for step, (i, x, y, _, _) in enumerate(data_prob):
             x = x.float().cuda()
             with torch.no_grad():
                 y_pred = tracknet(x).detach().cpu()
-            
+
             # Predict
             tmp_pred = evaluate(i, y_true=y, y_pred=y_pred, tolerance=param_dict['tolerance'])
             for key in tmp_pred.keys():
@@ -1306,7 +1165,7 @@ def test_rally_linear(model, rally_dir, param_dict):
             b_size, seq_len = i.shape[0], i.shape[1]
             with torch.no_grad():
                 y_pred = tracknet(x).detach().cpu()
-            
+
             y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
             ensemble_i = torch.empty((0, 1, 2), dtype=torch.float32)
             ensemble_y = torch.empty((0, 1, HEIGHT, WIDTH), dtype=torch.float32)
@@ -1320,7 +1179,7 @@ def test_rally_linear(model, rally_dir, param_dict):
                 else:
                     # General case
                     y_pred = (y_pred_buffer[batch_i+b, frame_i] * weight[:, None, None]).sum(0)
-                    
+
                 ensemble_i = torch.cat((ensemble_i, i[b][0].reshape(1, 1, 2)), dim=0)
                 ensemble_y = torch.cat((ensemble_y, y[b][0].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
                 ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
@@ -1330,7 +1189,7 @@ def test_rally_linear(model, rally_dir, param_dict):
                     # Last batch
                     y_zero_pad = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
                     y_pred_buffer = torch.cat((y_pred_buffer, y_zero_pad), dim=0)
-    
+
                     for f in range(1, seq_len):
                         # Last input sequence
                         y_pred = y_pred_buffer[batch_i+b+f, frame_i].sum(0)
@@ -1338,7 +1197,7 @@ def test_rally_linear(model, rally_dir, param_dict):
                         ensemble_i = torch.cat((ensemble_i, i[-1][f].reshape(1, 1, 2)), dim=0)
                         ensemble_y = torch.cat((ensemble_y, y[-1][f].reshape(1, 1, HEIGHT, WIDTH)), dim=0)
                         ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
-                    
+
             # Predict
             tmp_pred = evaluate(ensemble_i, y_true=ensemble_y, y_pred=ensemble_y_pred, tolerance=param_dict['tolerance'])
             for key in tmp_pred.keys():
@@ -1346,13 +1205,13 @@ def test_rally_linear(model, rally_dir, param_dict):
 
             # Update buffer, keep last predictions for ensemble in next iteration
             y_pred_buffer = y_pred_buffer[-buffer_size:]
-    
-    tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=30)
 
-    
+    tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, frame_w=w, frame_h=h, max_gap=10, border_margin_x=160, max_angle_diff=100.0, min_valid_run=1, angle_check_min_gap=8)
+
+
     file_format_str = os.path.join('{}', 'frame', '{}')
     match_dir, rally_id = parse.parse(file_format_str, rally_dir)
-    csv_file = os.path.join(match_dir, 'corrected_csv',f'{rally_id}_ball.csv')
+    csv_file = os.path.join(match_dir, 'corrected_csv', f'{rally_id}_ball.csv')
     label_df = pd.read_csv(csv_file, encoding='utf-8')
     x_gt, y_gt = label_df['X'].values / w, label_df['Y'].values / h
 
@@ -1368,12 +1227,12 @@ def test_rally_linear(model, rally_dir, param_dict):
         d_i = torch.cat((d_i, torch.tensor([[[0, i]]], dtype=torch.float32)), dim=0)
         coor = torch.cat((coor, torch.tensor([[[x_gt[i], y_gt[i]]]], dtype=torch.float32)), dim=0)
         coor_inpaint = torch.cat((coor_inpaint, torch.tensor([[[x_pred[i], y_pred[i]]]], dtype=torch.float32)), dim=0)
-    
-    inpaintnet_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[], 'Type':[]}
+
+    inpaintnet_pred_dict = {'Frame': [], 'X': [], 'Y': [], 'Visibility': [], 'Type': []}
     tmp_pred = evaluate(d_i, c_true=coor, c_pred=coor_inpaint, tolerance=param_dict['tolerance'], img_scaler=(w_scaler, h_scaler))
     for key in tmp_pred.keys():
         inpaintnet_pred_dict[key].extend(tmp_pred[key])
-    
+
     return inpaintnet_pred_dict
 
 if __name__ == '__main__':
@@ -1397,10 +1256,10 @@ if __name__ == '__main__':
     param_dict['num_workers'] = args.batch_size if args.batch_size <= 16 else 16
     param_dict['output_bbox'] = args.output_bbox
     param_dict['output_gt'] = False
-    
+
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
-    
+
     # Load parameter
     print(f'Loading checkpoint...')
     if args.tracknet_file:
@@ -1412,7 +1271,7 @@ if __name__ == '__main__':
         model = (tracknet, None)
     else:
         tracknet = None
-    
+
     if args.inpaintnet_file:
         inpaintnet_ckpt = torch.load(args.inpaintnet_file)
         param_dict['inpaintnet_seq_len'] = inpaintnet_ckpt['param_dict']['seq_len']
@@ -1450,14 +1309,14 @@ if __name__ == '__main__':
         print(f'Split: {args.split}')
         print(f'Evaluation mode: {args.eval_mode}')
         print(f'Tolerance Value: {args.tolerance}')
-        
+
         pred_dict = test(model, args.split, param_dict, linear_interp=args.linear_interp)
         if args.split == 'test':
             # Drop samples which is not in the effective trajectory
             res_dict = get_test_res(pred_dict, drop=True)
         else:
             res_dict = get_test_res(pred_dict, drop=False)
-        
+
         with open(eval_res_file, 'w') as f:
             json.dump(res_dict, f, indent=2)
 
@@ -1472,7 +1331,7 @@ if __name__ == '__main__':
                 dect_list = get_coco_res(pred_dict, drop=True)
             else:
                 dect_list = get_coco_res(pred_dict, drop=False)
-            
+
             mAP = {0.25:0, 0.5:0}
             coco_gt = COCO(os.path.join(data_dir, 'coco_format_gt.json'))
             coco_dt = coco_gt.loadRes(dect_list)
@@ -1483,7 +1342,7 @@ if __name__ == '__main__':
                 coco_eval.accumulate()
                 coco_eval.summarize()
                 mAP[iou_th] = coco_eval.stats[0]
-                
+
             coco_res_dict = dict(AP_25=mAP, detection=dect_list)
             with open(coco_file, 'w') as f:
                 json.dump(coco_res_dict, f, indent=2)
