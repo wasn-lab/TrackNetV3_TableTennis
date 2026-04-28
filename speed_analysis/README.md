@@ -134,7 +134,13 @@ xxx_zone_detail.csv
 
 ---
 
-## 速度計算方式
+## 速度分析
+
+速度使用的 frame 是從 hit_frame 到 bounce_frame，如果沒有 bounce_frame 就是算到 frame_end，主要為了避免 avg_speed 在計算時因彈跳後速度下降的問題
+
+這邊的設計會有一個問題是如果是打到網子的情況，很有可能因為彈跳幅度不夠，所以沒有被判斷成 bounce_frame，這種情況的 avg_speed 會略低，但我們主要是在意 net_zone_max_speed，所以這部份沒有去進行改善
+
+### 速度計算方式
 
 速度計算會先把球的 pixel 位移轉換成實際距離，再根據影片 FPS 換算成 km/h。
 
@@ -176,9 +182,8 @@ speed_kmh = distance_cm / time_sec * 0.036
 
 其中 `0.036` 是將 `cm/s` 轉換成 `km/h` 的係數。
 
----
 
-## 速度取樣方式
+### 速度取樣方式
 
 目前每個 frame 會嘗試計算多種速度候選：
 
@@ -194,9 +199,8 @@ speed_kmh = distance_cm / time_sec * 0.036
 
 如果某段速度超過上限，會被視為不合理資料並排除，避免錯誤偵測點造成速度異常放大。
 
----
 
-## 速度輸出欄位
+### 速度輸出欄位
 
 主要速度結果會輸出在：`xxx_stroke_zone.csv`
 
@@ -227,9 +231,8 @@ speed_kmh = distance_cm / time_sec * 0.036
 | `sx_cm_per_px` | x 方向 cm / pixel 比例 |
 | `sy_cm_per_px` | y 方向 cm / pixel 比例 |
 
----
 
-## Net Zone Max Speed
+### Net Zone Max Speed
 
 `net_zone_max_speed_kmh` 是特別關注的速度指標。它代表球通過網前區域附近時的最大速度。
 
@@ -251,9 +254,9 @@ speed_kmh = distance_cm / time_sec * 0.036
 
 這個模組的目的不是單純記錄 bounce frame，而是把影片中的落點像素座標轉換成桌面上的實際公分座標，讓後續可以用 heatmap、落點散佈圖與 CSV 統計來觀察選手的擊球落點分布。
 
-### 資料來源
+### 單獨使用時的資料來源
 
-落點分析主要會使用兩種資料：
+直接執行 `bounce_landing_analysis.py` 時，落點分析主要會使用兩種資料：
 
 | 資料 | 說明 |
 |---|---|
@@ -261,6 +264,8 @@ speed_kmh = distance_cm / time_sec * 0.036
 | `ball.csv` | TrackNetV3 輸出的逐幀球軌跡資料，包含 `Frame`、`Visibility`、`X`、`Y` |
 
 其中 `bounce_frame` 會用來找出該次擊球的落點 frame，再從 `ball.csv` 中取得該 frame 的球心座標。
+
+**這部分已經融合進 `stroke_zone_analyziz.py` 中了，所以不須單獨的執行**
 
 ### Perspective Transform
 
