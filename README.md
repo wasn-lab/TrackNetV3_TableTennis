@@ -6,6 +6,33 @@ TrackNetV3 主要由兩個模型組成：
 
 [模型下載](https://1drv.ms/u/c/ab3b33d5410e04f3/IQCwzwpuGP6pSpgw0VyyRSCzAa4jTyVFYiFWUgSd8gPeCf0?e=hWQh7G)
 
+- Develop Environment
+
+```text
+Python 3.8.7
+torch 1.10.0
+GPU environment is recommended
+```
+
+- Clone this repository.
+
+```bash
+git clone https://github.com/wasn-lab/TrackNetV3_TableTennis.git
+cd TrackNetV3_TableTennis
+```
+
+- Create environment.
+
+```bash
+conda create -n tracknetV3 python=3.8.7
+conda activate tracknetV3
+```
+
+- Install the requirements.
+```bash
+pip install -r requirements.txt
+```
+
 ---
 
 ## 主要內容
