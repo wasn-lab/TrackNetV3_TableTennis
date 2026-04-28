@@ -166,8 +166,6 @@ tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(
 )
 ```
 
-所以交接時如果是看 `predict.py` 的預測結果，要以這組實際呼叫值為主。
-
 ---
 
 #### 參數說明
