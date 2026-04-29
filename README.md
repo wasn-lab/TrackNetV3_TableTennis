@@ -24,7 +24,7 @@ cd TrackNetV3_TableTennis
 - Create environment.
 
 ```bash
-conda create -n tracknetV3 python=3.8.7
+conda create -n tracknetV3 python=3.8
 conda activate tracknetV3
 ```
 
