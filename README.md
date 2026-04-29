@@ -17,7 +17,7 @@ GPU environment is recommended
 - Clone this repository.
 
 ```bash
-git clone https://github.com/wasn-lab/TrackNetV3-TableTennis.git
+git clone https://github.com/cyt228/TrackNetV3_TableTennis.git
 cd TrackNetV3_TableTennis
 ```
 
