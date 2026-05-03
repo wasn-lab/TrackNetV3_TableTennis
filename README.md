@@ -9,8 +9,7 @@ TrackNetV3 主要由兩個模型組成：
 - Develop Environment
 
 ```text
-Python 3.8
-torch 1.10.0
+vast.ai 更新中
 GPU environment is recommended
 ```
 
