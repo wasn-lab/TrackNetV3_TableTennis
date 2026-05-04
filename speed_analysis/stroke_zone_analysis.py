@@ -52,6 +52,8 @@ class FrameReader:
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS))
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if self.fps <= 0:
+            self.fps = 120.0
 
     def read_frame(self, frame_id: int):
         if frame_id < 0 or frame_id >= self.total_frames:
@@ -62,6 +64,22 @@ class FrameReader:
 
     def release(self):
         self.cap.release()
+
+
+class CsvFrameInfo:
+    def __init__(self, df: pd.DataFrame, fps: float = 120.0, frame_w: int = 1920, frame_h: int = 1080):
+        self.video_path = None
+        self.cap = None
+        self.total_frames = int(df["Frame"].max()) + 1 if "Frame" in df.columns and len(df) > 0 else 0
+        self.fps = float(fps)
+        self.width = int(frame_w)
+        self.height = int(frame_h)
+
+    def read_frame(self, frame_id: int):
+        return None
+
+    def release(self):
+        pass
 
 
 def collect_predict_videos(video_root: str) -> List[str]:
@@ -85,6 +103,58 @@ def find_ball_csv_for_video(video_path: str, csv_suffixes=("_ball.csv", "_bass.c
         csv_path = os.path.join(video_dir, f"{stem}{suffix}")
         if os.path.exists(csv_path):
             return csv_path
+    return None
+
+
+def collect_ball_csvs(root_dir: str, csv_suffixes=("_ball.csv", "_bass.csv")) -> List[str]:
+    csv_files = []
+    for root, _, files in os.walk(root_dir):
+        for fname in files:
+            if any(fname.endswith(suffix) for suffix in csv_suffixes):
+                csv_files.append(os.path.join(root, fname))
+    return sorted(csv_files)
+
+
+def strip_csv_suffix(csv_path: str, csv_suffixes=("_ball.csv", "_bass.csv")) -> str:
+    name = os.path.basename(csv_path)
+    for suffix in csv_suffixes:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return os.path.splitext(name)[0]
+
+
+def find_video_for_ball_csv(ball_csv: str, video_root: Optional[str] = None, csv_suffixes=("_ball.csv", "_bass.csv")) -> Optional[str]:
+    stem = strip_csv_suffix(ball_csv, csv_suffixes)
+
+    # Prefer original input video. The analysis CSV is usually under save_root,
+    # while the original mp4 stays under video_root.
+    search_dirs = []
+    if video_root is not None:
+        search_dirs.append(video_root)
+    search_dirs.append(os.path.dirname(ball_csv))
+
+    for search_dir in search_dirs:
+        if search_dir is None or not os.path.exists(search_dir):
+            continue
+
+        direct_candidates = [
+            os.path.join(search_dir, f"{stem}.mp4"),
+            os.path.join(search_dir, f"{stem}.MP4"),
+            os.path.join(search_dir, f"{stem}_predict.mp4"),
+        ]
+        for video_path in direct_candidates:
+            if os.path.exists(video_path):
+                return video_path
+
+        for root, _, files in os.walk(search_dir):
+            for fname in files:
+                lower = fname.lower()
+                if not lower.endswith(".mp4"):
+                    continue
+                name_no_ext = os.path.splitext(fname)[0]
+                if name_no_ext == stem or name_no_ext == f"{stem}_predict":
+                    return os.path.join(root, fname)
+
     return None
 
 
@@ -153,7 +223,7 @@ def average_geometries(geometry_list: List[Dict]) -> Optional[Dict]:
 
 def select_zone_for_stroke_from_video(
     stroke: Dict,
-    frame_reader: FrameReader,
+    frame_reader,
     geometry_cache: Dict[int, Dict],
     window: int = 2,
     up_px: int = 140,
@@ -374,7 +444,7 @@ def build_stroke_summary_csv(
     df: pd.DataFrame,
     strokes: List[Dict],
     fps: float,
-    frame_reader: FrameReader,
+    frame_reader,
     zone_window: int = 2,
     up_px: int = 140,
     left_shift_px: int = 160,
@@ -390,11 +460,13 @@ def build_stroke_summary_csv(
         note = stroke["note"]
         speed_metrics = None
 
-        if stroke.get("hit_frame") is not None:
+        if stroke.get("hit_frame") is not None and table_corners is not None and fps is not None and fps > 0:
             speed_metrics = compute_speed_metrics_for_stroke(df, stroke, fps, table_corners, net_zone_points)
             if speed_metrics is None:
                 valid = 0
                 note = "hit_found_but_no_clean_speed_segment"
+        elif stroke.get("hit_frame") is not None and table_corners is None:
+            note = append_note(note, "no_video_or_table_geometry")
 
         note = update_net_note(df, stroke, net_zone_points, note)
 
@@ -541,9 +613,28 @@ def keep_columns(df: pd.DataFrame, keep_cols: List[str]) -> pd.DataFrame:
     return out[keep_cols]
 
 
+def has_valid_zone_geometry(summary_df_full: pd.DataFrame) -> bool:
+    if summary_df_full.empty:
+        return False
+
+    required_cols = TABLE_OUT_COLS + NET_OUT_COLS
+    for col in required_cols:
+        if col not in summary_df_full.columns:
+            return False
+
+    zone_df = summary_df_full[required_cols].replace("", np.nan)
+    return zone_df.notna().any(axis=1).any()
+
+
 def run_landing_analysis_with_module(summary_df_full: pd.DataFrame, traj_df: pd.DataFrame, save_dir: str) -> pd.DataFrame:
+    if not has_valid_zone_geometry(summary_df_full):
+        print("[WARN] no valid table/net geometry, skip landing analysis.")
+        return pd.DataFrame()
+
     landing.OUT_DIR = save_dir
-    df_land = landing.compute_landings(summary_df_full, traj_df)
+    safe_summary = summary_df_full.copy()
+    safe_summary[ZONE_OUT_COLS] = safe_summary[ZONE_OUT_COLS].replace("", np.nan)
+    df_land = landing.compute_landings(safe_summary, traj_df)
 
     if not df_land.empty:
         landing.save_stats(df_land)
@@ -566,6 +657,10 @@ def process_single_video(
     zone_window=2,
     up_px=140,
     left_shift_px=160,
+    fps=120.0,
+    frame_w=1920,
+    frame_h=1080,
+    save_video=False,
 ):
     ensure_dir(save_dir)
     df = pd.read_csv(ball_csv)
@@ -574,7 +669,11 @@ def process_single_video(
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
 
-    frame_reader = FrameReader(video_file)
+    has_video = video_file is not None and os.path.exists(video_file)
+    frame_reader = FrameReader(video_file) if has_video else CsvFrameInfo(df, fps=fps, frame_w=frame_w, frame_h=frame_h)
+    if not has_video:
+        print(f"[WARN] no original/predict mp4 found for csv, run csv-only mode: {ball_csv}")
+
     try:
         strokes = detect_strokes_from_runs(
             df=df,
@@ -605,7 +704,7 @@ def process_single_video(
                 how="left",
             )
 
-        base = os.path.splitext(os.path.basename(video_file))[0]
+        base = os.path.splitext(os.path.basename(video_file))[0] if has_video else strip_csv_suffix(ball_csv)
         csv_path = os.path.join(save_dir, f"{base}_stroke_zone.csv")
         zone_detail_csv_path = os.path.join(save_dir, f"{base}_zone_detail.csv")
         speed_compare_csv_path = os.path.join(save_dir, f"{base}_stroke_speed_compare.csv")
@@ -614,19 +713,28 @@ def process_single_video(
         build_export_stroke_csv(summary_df_full).to_csv(csv_path, index=False, encoding="utf-8-sig")
         build_export_zone_detail_csv(summary_df_full).to_csv(zone_detail_csv_path, index=False, encoding="utf-8-sig")
         build_export_speed_compare_csv(summary_df_full).to_csv(speed_compare_csv_path, index=False, encoding="utf-8-sig")
-        draw_visual_video(video_file, df, strokes, summary_df_full, video_path)
+        if save_video and has_video:
+            draw_visual_video(video_file, df, strokes, summary_df_full, video_path)
+        elif save_video and not has_video:
+            print("[WARN] --save_video was set, but no mp4 was found. Skip visual video output.")
     finally:
         frame_reader.release()
 
     print(f"saved csv   : {csv_path}")
     print(f"saved zone  : {zone_detail_csv_path}")
     print(f"saved speed : {speed_compare_csv_path}")
-    print(f"saved video : {video_path}")
+    if save_video and has_video:
+        print(f"saved video : {video_path}")
+    elif save_video and not has_video:
+        print("saved video : skipped (no matching mp4)")
+    else:
+        print("saved video : skipped (--save_video not set)")
     print(f"num strokes : {len(summary_df_full)}")
 
 
 def process_video_root(
     video_root,
+    save_root=None,
     csv_suffixes=("_ball.csv", "_bass.csv"),
     min_left_segments=5,
     min_candidate_frames=50,
@@ -637,25 +745,26 @@ def process_video_root(
     zone_window=2,
     up_px=140,
     left_shift_px=160,
+    fps=120.0,
+    frame_w=1920,
+    frame_h=1080,
+    save_video=False,
 ):
-    video_files = collect_predict_videos(video_root)
-    if not video_files:
-        raise RuntimeError(f"No *_predict.mp4 files found under: {video_root}")
+    search_root = save_root if save_root is not None else video_root
+    ball_csv_files = collect_ball_csvs(search_root, csv_suffixes=csv_suffixes)
+    if not ball_csv_files:
+        raise RuntimeError(f"No ball csv files found under: {search_root}")
 
-    print(f"[INFO] found {len(video_files)} videos under {video_root}")
+    print(f"[INFO] video_root : {video_root}")
+    print(f"[INFO] search_root: {search_root}")
+    print(f"[INFO] found {len(ball_csv_files)} csv files under {search_root}")
 
-    for i, video_file in enumerate(video_files, 1):
-        ball_csv = find_ball_csv_for_video(video_file, csv_suffixes=csv_suffixes)
-        if ball_csv is None:
-            print("=" * 80)
-            print(f"[BATCH] ({i}/{len(video_files)})")
-            print(f"[SKIP] no matching csv for: {video_file}")
-            continue
-
-        save_dir = os.path.dirname(video_file)
+    for i, ball_csv in enumerate(ball_csv_files, 1):
+        video_file = find_video_for_ball_csv(ball_csv, video_root=video_root, csv_suffixes=csv_suffixes)
+        save_dir = os.path.dirname(ball_csv)
         print("=" * 80)
-        print(f"[BATCH] ({i}/{len(video_files)})")
-        print(f"[BATCH] video    : {video_file}")
+        print(f"[BATCH] ({i}/{len(ball_csv_files)})")
+        print(f"[BATCH] video    : {video_file if video_file else 'None (csv-only)'}")
         print(f"[BATCH] ball csv : {ball_csv}")
         print(f"[BATCH] save dir : {save_dir}")
 
@@ -673,6 +782,10 @@ def process_video_root(
                 zone_window=zone_window,
                 up_px=up_px,
                 left_shift_px=left_shift_px,
+                fps=fps,
+                frame_w=frame_w,
+                frame_h=frame_h,
+                save_video=save_video,
             )
         except Exception as e:
             print(f"[ERROR] failed on {video_file}")
@@ -685,6 +798,8 @@ def parse_args():
     parser.add_argument("--ball_csv", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--video_root", type=str, default=None)
+    parser.add_argument("--save_root", type=str, default=None)
+    parser.add_argument("--save_video", action="store_true")
     parser.add_argument("--csv_suffixes", type=str, nargs="+", default=["_ball.csv", "_bass.csv"])
     parser.add_argument("--min_left_segments", type=int, default=5)
     parser.add_argument("--min_candidate_frames", type=int, default=50)
@@ -695,6 +810,9 @@ def parse_args():
     parser.add_argument("--zone_window", type=int, default=2)
     parser.add_argument("--up_px", type=int, default=140)
     parser.add_argument("--left_shift_px", type=int, default=160)
+    parser.add_argument("--fps", type=float, default=120.0)
+    parser.add_argument("--frame_w", type=int, default=1920)
+    parser.add_argument("--frame_h", type=int, default=1080)
     return parser.parse_args()
 
 
@@ -704,6 +822,7 @@ def main():
     if args.video_root is not None:
         process_video_root(
             video_root=args.video_root,
+            save_root=args.save_root,
             csv_suffixes=tuple(args.csv_suffixes),
             min_left_segments=args.min_left_segments,
             min_candidate_frames=args.min_candidate_frames,
@@ -714,12 +833,16 @@ def main():
             zone_window=args.zone_window,
             up_px=args.up_px,
             left_shift_px=args.left_shift_px,
+            fps=args.fps,
+            frame_w=args.frame_w,
+            frame_h=args.frame_h,
+            save_video=args.save_video,
         )
         return
 
-    if args.video_file is not None:
+    if args.video_file is not None or args.ball_csv is not None:
         if args.ball_csv is None or args.save_dir is None:
-            raise ValueError("single video mode requires --video_file --ball_csv --save_dir")
+            raise ValueError("single mode requires --ball_csv --save_dir. --video_file is optional.")
 
         process_single_video(
             video_file=args.video_file,
@@ -734,10 +857,14 @@ def main():
             zone_window=args.zone_window,
             up_px=args.up_px,
             left_shift_px=args.left_shift_px,
+            fps=args.fps,
+            frame_w=args.frame_w,
+            frame_h=args.frame_h,
+            save_video=args.save_video,
         )
         return
 
-    raise ValueError("Please provide either --video_root or --video_file")
+    raise ValueError("Please provide either --video_root or --ball_csv")
 
 
 if __name__ == "__main__":
