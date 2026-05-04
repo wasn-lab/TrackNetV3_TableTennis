@@ -6,12 +6,19 @@ TrackNetV3 主要由兩個模型組成：
 
 [模型下載](https://1drv.ms/u/c/ab3b33d5410e04f3/IQCwzwpuGP6pSpgw0VyyRSCzAa4jTyVFYiFWUgSd8gPeCf0?e=hWQh7G)
 
-- Develop Environment
+- Development Environment
+
+租vast.ai，也可以用5090
 
 ```text
-vast.ai 更新中
-GPU environment is recommended
-```
+Platform: Vast.ai
+GPU: NVIDIA GeForce RTX 4090
+VRAM: 24 GB
+CPU: 12–24 vCPU
+RAM: 64 GB or above
+Disk: 150 GB or above
+Runtime: Linux container
+Access: Jupyter Terminal / VSCode Remote SSH
 
 - Clone this repository.
 
