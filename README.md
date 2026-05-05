@@ -18,7 +18,6 @@ Disk: 50 GB
 CUDA: 13.1
 Runtime: Linux container
 Image: vastai/base-image_cuda-13.1.1-auto/jupyter
->>>>>>> eafb225 (Inference Pipeline 效能優化)
 Access: Jupyter Terminal / VSCode Remote SSH
 ```
 > 注意：GPU 可以用來跑模型 inference，但影片輸出是否能使用 GPU 硬體編碼，還要看該台機器是否支援 NVENC。若 `h264_nvenc` 失敗，請改用 CPU 編碼 `libx264`
@@ -34,7 +33,6 @@ cd TrackNetV3_TableTennis
 
 ```bash
 conda create -n tracknetV3 python=3.11
->>>>>>> eafb225 (Inference Pipeline 效能優化)
 conda activate tracknetV3
 ```
 
