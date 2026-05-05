@@ -10,14 +10,18 @@ TrackNetV3 主要由兩個模型組成：
 
 ```text
 Platform: Vast.ai
-GPU: NVIDIA GeForce RTX 4090
-VRAM: 24 GB
-CPU: 12–24 vCPU
-RAM: 64 GB or above
-Disk: 150 GB or above
+GPU: NVIDIA GeForce RTX 5080
+VRAM: 16 GB
+CPU: AMD EPYC 7352, 24 vCPU
+RAM: 32 GB
+Disk: 50 GB
+CUDA: 13.1
 Runtime: Linux container
+Image: vastai/base-image_cuda-13.1.1-auto/jupyter
+>>>>>>> eafb225 (Inference Pipeline 效能優化)
 Access: Jupyter Terminal / VSCode Remote SSH
 ```
+> 注意：GPU 可以用來跑模型 inference，但影片輸出是否能使用 GPU 硬體編碼，還要看該台機器是否支援 NVENC。若 `h264_nvenc` 失敗，請改用 CPU 編碼 `libx264`
 
 - Clone this repository.
 
@@ -29,7 +33,8 @@ cd TrackNetV3_TableTennis
 - Create environment.
 
 ```bash
-conda create -n tracknetV3 python=3.8
+conda create -n tracknetV3 python=3.11
+>>>>>>> eafb225 (Inference Pipeline 效能優化)
 conda activate tracknetV3
 ```
 
@@ -55,27 +60,51 @@ pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https
 
 ## 主要內容
 
-從原版 TrackNetV3 修改而來，目前主要修改重點放在：
+從原版 TrackNetV3 修改而來，目前主要修改重點放在 predict inference、影片讀取效率、後處理追蹤與輸出格式。
 
-- `predict.py`
-  - 支援單支影片預測
-  - 支援整個資料夾批次預測
-  - 支援輸出預測影片
-  - 支援大影片模式
-  - 修改 inpaint mask 的補洞條件
+### `predict.py`
 
-- `utils/general.py`
-  - 修改輸出影片格式
-  - 修改預測軌跡顯示方式
-  - 修改 `generate_inpaint_mask()`
+- 支援單支影片預測：`--video_file`
+- 支援整個資料夾遞迴批次預測：`--video_dir`
+- 支援大影片模式：`--large_video`
+- 支援三種 eval mode：`nonoverlap`、`average`、`weight`
+- 支援輸出預測影片：`--output_video`
+- 新增影片編碼選擇：`--video_codec h264_nvenc | libx264`
+- 新增 timing report，會印出單支影片與整批影片各階段耗時
+- 預測結果 csv 會固定包含 `Inpaint_Mask`
+- 使用 `PrefetchLoader` 預先讀取 batch，減少 dataloader 等待時間
+- 保留後處理流程：candidate selection、reset、stale filter、inpaint mask、InpaintNet 補點
 
-- `test.py`
-  - 主要保留原版 evaluation / testing 流程
-  - 目前也放了一些 `predict.py` 會引用的後處理 function，例如 `get_ensemble_weight()`、`generate_inpaint_mask()`、`predict_location_candidates()`、`select_best_candidate()`、`should_reset_track()` 等
+### `dataset.py`
 
-train 相關流程基本沿用原版 TrackNetV3，之後如果要重新訓練，可以參考[TrackNetV3 原始專案](https://github.com/qaz812345/TrackNetV3)
+- `Video_IterableDataset` 用於 `--large_video`，避免一次把整部影片全部讀進 RAM
+- 使用串流讀取與 deque sliding window，降低大影片記憶體使用
+- median image 產生流程改為順序讀取與抽樣，並輸出 median 產生時間
+- 支援 `--max_sample_num` 控制 median 最多取樣 frame 數
+- 支援 `--video_range start,end` 指定使用影片某段秒數產生 median background
+- 對 `subtract`、`subtract_concat`、`concat` 等 background mode 做預處理加速
 
-[speed analysis](./speed_analysis) 的詳細介紹另外放在 `speed_analysis/`中
+### `utils/general.py`
+
+- 新增 `FFmpegWriter`，以 ffmpeg subprocess 輸出 mp4
+- `write_pred_video()` 支援 `h264_nvenc` 與 `libx264`
+- 預測影片會顯示目前 frame index、球的當前位置與歷史軌跡
+- `write_pred_csv()` 會輸出 `Frame`、`Visibility`、`X`、`Y`、`Inpaint_Mask`
+- 若是 InpaintNet 訓練資料模式，也可輸出 GT 相關欄位
+
+### `test.py`
+
+`predict.py` 會引用其中的後處理 function，例如：
+
+- `get_ensemble_weight()`
+- `generate_inpaint_mask()`
+- `predict_location_candidates()`
+- `select_best_candidate()`
+- `should_reset_track()`
+
+train 相關流程基本沿用原版 TrackNetV3。若要重新訓練，可以參考 [TrackNetV3 原始專案](https://github.com/qaz812345/TrackNetV3)。
+
+[speed analysis](./speed_analysis) 的詳細介紹另外放在 `speed_analysis/` 中
 
 ---
 
@@ -109,25 +138,63 @@ python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.p
 ### 整個資料夾預測
 
 ```bash
-python predict.py --video_dir /home/code-server/NO3 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir /home/code-server/NO3/pred_result --eval_mode weight --output_video --large_video
+python predict.py --video_dir /home/code-server/NO3 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir /home/code-server/NO3_pred_result --eval_mode weight --output_video --large_video
 ```
 
-### predict.py 參數說明
+`--video_dir` 會遞迴搜尋 `.mp4` / `.MP4`。如果原始影片有子資料夾，輸出也會保留相對子資料夾結構。
+
+### 使用 CPU 編碼輸出影片
+
+如果 Vast.ai 的 GPU 不支援 NVENC，或出現 `h264_nvenc` 相關錯誤，可以改用 CPU 編碼：
+
+```bash
+python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --output_video --large_video --video_codec libx264
+```
+
+### 只輸出 csv，不輸出影片
+
+如果只需要球座標，建議不要加 `--output_video`，可以省下影片編碼時間，也可以避開 GPU / CPU 影片編碼問題：
+
+```bash
+python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --large_video
+```
+
+
+## predict.py 參數說明
 
 | 參數 | 說明 |
 |---|---|
 | `--video_file` | 單支影片路徑 |
-| `--video_dir` | 整個資料夾批次預測 |
+| `--video_dir` | 整個資料夾批次預測，會遞迴搜尋 `.mp4` / `.MP4` |
 | `--tracknet_file` | TrackNet 權重檔 |
 | `--inpaintnet_file` | InpaintNet 權重檔，不填則只跑 TrackNet |
 | `--batch_size` | inference batch size，預設 16 |
 | `--eval_mode` | temporal ensemble 模式，可選 `nonoverlap`、`average`、`weight` |
-| `--max_sample_num` | 大影片產生 median background 時最多取樣幾個 frame |
+| `--max_sample_num` | 大影片產生 median background 時最多取樣幾個 frame，預設 1800 |
 | `--video_range` | 指定用哪一段影片秒數產生 background，例如 `324,330` |
 | `--save_dir` | 輸出資料夾 |
-| `--large_video` | 大影片模式，使用 IterableDataset，避免記憶體爆掉 |
+| `--large_video` | 大影片模式，使用 `Video_IterableDataset`，避免記憶體爆掉 |
 | `--output_video` | 是否輸出畫上軌跡的影片 |
 | `--traj_len` | 輸出影片中顯示幾個 frame 的歷史軌跡，預設 8 |
+| `--video_codec` | 輸出影片編碼器，可選 `h264_nvenc` 或 `libx264`，預設 `h264_nvenc` |
+
+## eval_mode 說明
+
+| 模式 | 說明 | 特性 |
+|---|---|---|
+| `weight` | 使用 temporal weighted ensemble | 較穩定，但速度較慢 |
+| `average` | 使用平均 ensemble | 穩定度與速度介於中間 |
+| `nonoverlap` | 不重疊 sliding window | 較快，但穩定度可能較低 |
+
+一般建議：
+
+```text
+想要結果穩定：weight
+想要速度較快：nonoverlap
+想要折衷：average
+```
+
+> 建議使用 weight 最穩定
 
 ### 輸出檔案
 
@@ -150,13 +217,115 @@ csv 格式：
 
 ---
 
+## Timing Report
+
+目前 `predict.py` 會輸出每支影片的 timing report，以及整批影片的 overall timing report。這是用來分析時間花在哪些階段。
+
+常見欄位包含：
+
+| 階段 | 說明 |
+|---|---|
+| `0_setup/load_tracknet` | 載入 TrackNet 權重 |
+| `0_setup/load_inpaintnet` | 載入 InpaintNet 權重 |
+| `1_tracknet/dataset_init.dataset_ctor` | 建立 TrackNet dataset |
+| `1_tracknet/dataset_init.dataloader_ctor` | 建立 TrackNet dataloader |
+| `1_tracknet/dataloader_wait` | 等待 dataloader 取 batch |
+| `1_tracknet/data_to_gpu` | 將資料搬到 GPU |
+| `1_tracknet/gpu_inference` | TrackNet GPU inference |
+| `1_tracknet/ensemble_buffer` | weight / average 模式的 temporal ensemble |
+| `1_tracknet/post_predict` | heatmap 轉座標與後處理 |
+| `2_inpaint/gen_mask` | 產生 Inpaint_Mask |
+| `2_inpaint/gpu_inference` | InpaintNet GPU inference |
+| `3_output/write_csv` | 輸出 csv |
+| `3_output/write_video` | 輸出預測影片 |
+
+如果 report 中 `dataloader_wait` 很高，通常代表影片讀取、resize、median 或 CPU preprocessing 是瓶頸。  
+如果 `gpu_inference` 很高，則主要瓶頸在模型推論。  
+如果 `write_video` 很高，代表影片輸出編碼花費較多時間。
+
+---
+
+## GPU 影片輸出問題與解法
+
+目前預設影片輸出使用：
+
+```bash
+--video_codec h264_nvenc
+```
+
+也就是 NVIDIA GPU 硬體編碼。理論上速度比較快，但在 Vast.ai 上不一定每台機器都能使用 NVENC。即使 `nvidia-smi` 可以看到 GPU、`ffmpeg -encoders` 有列出 `h264_nvenc`，仍可能因為 GPU 型號、驅動、container 權限或 NVENC support 問題導致失敗。
+
+常見錯誤：
+
+```text
+[h264_nvenc] OpenEncodeSessionEx failed: unsupported device (2)
+No capable devices found
+```
+
+或：
+
+```text
+ffmpeg pipe broken
+```
+
+這種情況不是 TrackNet 模型推論失敗，而是輸出 mp4 影片時的 ffmpeg 編碼失敗。
+
+### 解法 1：改用 CPU 編碼
+
+```bash
+python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --output_video --large_video --video_codec libx264
+```
+
+CPU 編碼比較慢，但相容性最高。
+
+### 解法 2：不輸出影片，只輸出 csv
+
+```bash
+python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --large_video
+```
+
+不加 `--output_video` 時，程式仍會輸出 `*_ball.csv`，後續的 speed analysis 可以繼續使用。
+
+### 解法 3：先檢查 NVENC 是否可用
+
+```bash
+ffmpeg -hide_banner -encoders | grep nvenc
+ffmpeg -h encoder=h264_nvenc
+ffmpeg -y -f lavfi -i testsrc=size=1280x720:rate=30 -t 3 -c:v h264_nvenc test_nvenc.mp4
+```
+
+如果測試指令也失敗，代表該環境不能使用 NVENC，請改用 `--video_codec libx264`。
+
+---
+
+## 大影片模式與 median background
+
+當使用 `--large_video` 時，程式會使用 `Video_IterableDataset` 串流讀影片，不會一次把整部影片載入記憶體。
+
+如果模型使用 background mode，例如 `concat`、`subtract` 或 `subtract_concat`，程式會先產生 median background。可以用下面兩個參數控制：
+
+| 參數 | 說明 |
+|---|---|
+| `--max_sample_num` | 最多取樣多少 frame 來產生 median |
+| `--video_range` | 只使用指定秒數範圍產生 median，例如 `10,20` |
+
+範例：
+
+```bash
+python predict.py --video_file 048/C0045.mp4 --tracknet_file exp/TrackNet_best.pt --inpaintnet_file exp/InpaintNet_best.pt --save_dir 048 --eval_mode weight --large_video --max_sample_num 1800 --video_range 10,20
+```
+
+`--video_range 10,20` 代表使用影片第 10 秒到第 20 秒的 frame 產生 median background，不代表只預測 10 到 20 秒；預測仍會跑完整支影片。
+
+---
+
 ## 修改 / 新增的核心邏輯
 這部分主要說明本專案為了讓 TrackNetV3 更適合桌球影片，額外修改或新增的後處理邏輯。主要包含：
 
 - `generate_inpaint_mask()`：決定哪些缺失軌跡要交給 InpaintNet 補
 - `select_best_candidate()`：當同一 frame 有多個候選球點時，選出最可能是真球的位置
 - `should_reset_track()`：判斷目前是不是追錯球，是否需要重新開始追蹤
-- `write_pred_video()`：輸出預測影片，方便檢查軌跡結果
+- `write_pred_video()`：輸出預測影片，方便檢查軌跡結果，要注意從 GPU 還是 CPU 輸出
 - `predict.py`：支援單支影片與整個資料夾批次預測
 
 ### `generate_inpaint_mask()`：控制哪些缺失片段要補
@@ -991,6 +1160,28 @@ reset 後的概念是：
 不要再用舊的軌跡方向去限制候選點，
 讓程式重新從目前 frame 的 candidates 裡找最可能的球。
 ```
+
+---
+
+## Inference Pipeline 效能優化
+
+本版本針對推論流程做了部分效能優化，主要目的是降低大影片處理時的記憶體使用量，並減少重複的 frame preprocessing。
+
+### 主要修改
+
+| 修改位置 | 說明 |
+|---|---|
+| `dataset.py` | 重構 `Video_IterableDataset`，使用串流讀取與 deque sliding window |
+| `dataset.py` | 每個 frame 只做一次 resize、background subtraction、normalization，避免 sliding window 重複處理同一批 frame |
+| `dataset.py` | median background 產生改為抽樣讀取，可搭配 `--max_sample_num` 與 `--video_range` 使用 |
+| `utils/general.py` | `write_pred_video()` 改用 FFmpeg subprocess 輸出 mp4 |
+| `utils/general.py` | 支援 `h264_nvenc` GPU 編碼與 `libx264` CPU 編碼 |
+| `predict.py` | 加入 timing report，方便觀察 dataloader、GPU inference、post-process、video writing 各階段耗時 |
+
+### 設計重點
+
+原本 sliding window 在 `sliding_step=1` 時，相鄰 sample 會共用大部分 frame，但每次仍會重新做 resize、background subtraction 與 normalization。  
+新版改成每個 frame 只預處理一次，再用 deque 組成 sliding window，因此可以減少 CPU preprocessing 的重複計算。
 
 ---
 

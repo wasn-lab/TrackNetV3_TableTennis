@@ -13,6 +13,9 @@ tensorboard==2.14.0
 
 # Evaluation
 pycocotools==2.0.7
+psutil
+prefetch_generator
+av
 
 # Visualization / analysis
 matplotlib==3.7.5

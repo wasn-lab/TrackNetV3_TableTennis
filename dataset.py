@@ -2,6 +2,7 @@ import os
 import cv2
 import math
 import parse
+import time
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -699,116 +700,260 @@ class Video_IterableDataset(IterableDataset):
         # Image size
         self.HEIGHT = HEIGHT
         self.WIDTH = WIDTH
-
         self.video_file = video_file
         self.cap = cv2.VideoCapture(self.video_file)
         self.video_len = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-        self.w, self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.w_scaler, self.h_scaler = self.w / self.WIDTH, self.h / self.HEIGHT
-
-
         self.seq_len = seq_len
         self.sliding_step = sliding_step
         self.bg_mode = bg_mode
         if self.bg_mode:
             self.median = median if median is not None else self.__gen_median__(max_sample_num, video_range)
+            print(f"median shape: {self.median.shape}, dtype: {self.median.dtype}")
+        # 預先準備 median（避免 __iter__ 裡每次都轉）
+        if self.bg_mode in ('subtract', 'subtract_concat'):
+            self._median_hwc_i16 = self._get_median_hwc().astype(np.int16)
+        if self.bg_mode == 'concat':
+            self._median_chw_f32 = self._get_median_chw().astype(np.float32) / 255.0
+
+
+    def _preprocess_one_frame(self, frame_bgr):
+        """處理單一 frame → 回傳 (C, H, W) float32 in [0,1]
+        這裡的 C 取決於 bg_mode:
+          - '':              C=3   (只有 RGB)
+          - 'subtract':      C=1   (只有 diff)
+          - 'subtract_concat': C=4 (RGB + diff)
+          - 'concat':        C=3   (只有 RGB；median 之後再 prepend)
+        """
+        # BGR → RGB 且 resize
+        rgb = cv2.resize(frame_bgr, (self.WIDTH, self.HEIGHT), interpolation=cv2.INTER_LINEAR)
+        rgb = rgb[..., ::-1]  # BGR → RGB, shape=(H,W,3) uint8
+        if not self.bg_mode:
+            out = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0  # (3,H,W)
+            return out
+        if self.bg_mode == 'subtract':
+            diff = np.abs(rgb.astype(np.int16) - self._median_hwc_i16).sum(axis=2)
+            return (diff.astype(np.float32) / 255.0)[np.newaxis]   # (1,H,W)
+        if self.bg_mode == 'subtract_concat':
+            diff = np.abs(rgb.astype(np.int16) - self._median_hwc_i16).sum(axis=2)  # (H,W)
+            rgb_chw = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0             # (3,H,W)
+            diff_chw = (diff.astype(np.float32) / 255.0)[np.newaxis]                 # (1,H,W)
+            return np.concatenate([rgb_chw, diff_chw], axis=0)                       # (4,H,W)
+        if self.bg_mode == 'concat':
+            # 每幀只回傳 RGB，median 在外面統一 prepend
+            return rgb.transpose(2, 0, 1).astype(np.float32) / 255.0  # (3,H,W)
+        raise ValueError(f"Unknown bg_mode: {self.bg_mode}")
+    
 
     def __iter__(self):
-        """ Return the data squentially. """
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        success = True
-        start_f_id, end_f_id = 0, 0
-        frame_list = []
-        while success:
-            # Sample frames
-            while len(frame_list) < self.seq_len:
-                success, frame = self.cap.read()
+        """串流讀取：每幀只 preprocess 一次，用 deque 做滑動視窗"""
+        from collections import deque
+        cap = cv2.VideoCapture(self.video_file)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        buf = deque(maxlen=self.seq_len)  # 存已處理好的 (C,H,W) float32
+        start_f_id = 0
+        next_read_f_id = 0  # 下一個要讀的原始 frame index
+        # 先填滿 buffer
+        while len(buf) < self.seq_len:
+            success, frame = cap.read()
+            if not success:
+                break
+            buf.append(self._preprocess_one_frame(frame))
+            next_read_f_id += 1
+        if len(buf) == 0:
+            cap.release()
+            return
+        # 若影片比 seq_len 短，做 padding
+        while len(buf) < self.seq_len:
+            buf.append(buf[-1].copy())
+        # 主迴圈：每次輸出一個 sample，再 slide
+        while True:
+            # 組裝當前 sample
+            end_f_id = next_read_f_id  # 此刻 buf 最後一幀的下一個 idx
+            # data_idx: 原始 frame id 對應
+            seq_start = end_f_id - self.seq_len
+            data_idx = np.array([(0, seq_start + i) for i in range(self.seq_len)])
+            frames = self._assemble(buf)  # 把 deque 拼成最終 tensor
+            yield data_idx, frames
+            # 滑動 sliding_step：丟掉前 sliding_step 幀，讀入 sliding_step 新幀
+            produced_new = 0
+            for _ in range(self.sliding_step):
+                success, frame = cap.read()
                 if not success:
                     break
-                frame_list.append(frame)
-                end_f_id += 1
+                buf.append(self._preprocess_one_frame(frame))  # deque maxlen=seq_len 會自動丟最舊
+                next_read_f_id += 1
+                produced_new += 1
+            if produced_new < self.sliding_step:
+                # 影片讀完，結束
+                break
+        cap.release()
 
-            # Form a sequence
-            data_idx = [(0, i) for i in range(start_f_id, end_f_id)]
-            if len(data_idx) < self.seq_len:
-                # Padding the last sequence if imcompleted
-                data_idx.extend([(0, end_f_id-1)]*(self.seq_len - len(data_idx)))
-                frame_list.extend([frame_list[-1]]*(self.seq_len - len(frame_list)))
-            data_idx = np.array(data_idx)
-            frames = self.__process__(np.array(frame_list)[..., ::-1])
-            yield data_idx, frames
-
-            # Update the sliding window
-            frame_list = frame_list[self.sliding_step:]
-            start_f_id = start_f_id + self.sliding_step
-
-        self.cap.release()
-
+    def _assemble(self, buf):
+        """把 seq_len 個已處理幀串成最終輸出 shape。"""
+        # buf 裡每個元素 shape=(C, H, W)
+        stacked = np.stack(list(buf), axis=0)  # (seq_len, C, H, W)
+        if self.bg_mode == 'concat':
+            # 需要在最前面 prepend median (3,H,W)
+            # stacked: (seq_len, 3, H, W) → (seq_len*3, H, W)
+            flat = stacked.reshape(-1, self.HEIGHT, self.WIDTH)
+            return np.concatenate([self._median_chw_f32, flat], axis=0)
+        else:
+            # 其他模式：(seq_len, C, H, W) → (seq_len*C, H, W)
+            return stacked.reshape(-1, self.HEIGHT, self.WIDTH)
+        
     def __gen_median__(self, max_sample_num, video_range):
-        """ Generate the median image.
-
-            Args:
-                max_sample_num (int): Maximum number of frames to sample for generating median image.
-                video_range (Tuple[int]): Range of start second and end second of the video for generating median image.
-        """
         print('Generate median image...')
+        t_total = time.perf_counter()
+    
         if video_range is None:
             start_frame, end_frame = 0, self.video_len
         else:
             start_frame = max(0, video_range[0] * self.fps)
             end_frame = min(video_range[1] * self.fps, self.video_len)
         video_seg_len = end_frame - start_frame
-
-        if video_seg_len > max_sample_num:
-            sample_step = video_seg_len // max_sample_num
-        else:
-            sample_step = 1
-        
-        frame_list = []
-        for i in range(start_frame, end_frame, sample_step):
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            success, frame = self.cap.read()
+        sample_step = max(1, video_seg_len // max_sample_num)
+    
+        cap = cv2.VideoCapture(self.video_file)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
+        # 🚀 順序讀：grab() 跳過不要的幀，只 decode 需要的
+        n_sample = (end_frame - start_frame + sample_step - 1) // sample_step
+        small_frames = np.empty((n_sample, self.HEIGHT, self.WIDTH, 3), dtype=np.uint8)
+    
+        t_read = time.perf_counter()
+        idx = 0
+        cur = start_frame
+        while cur < end_frame and idx < n_sample:
+            # 要 decode 的幀
+            success, frame = cap.read()
             if not success:
                 break
-            frame_list.append(frame)
-        median = np.median(frame_list, 0)[..., ::-1] # BGR to RGB
+            small_frames[idx] = cv2.resize(frame, (self.WIDTH, self.HEIGHT),
+                                           interpolation=cv2.INTER_LINEAR)
+            idx += 1
+            cur += 1
+    
+            # 跳過 sample_step - 1 幀（只 demux，不 decode）
+            for _ in range(sample_step - 1):
+                if cur >= end_frame:
+                    break
+                if not cap.grab():
+                    break
+                cur += 1
+    
+        cap.release()
+        small_frames = small_frames[:idx]
+        print(f'  [median] read+resize {idx} frames: {time.perf_counter()-t_read:.2f}s')
+    
+        t_med = time.perf_counter()
+        median = np.median(small_frames, axis=0).astype(np.uint8)[..., ::-1]  # RGB
+        print(f'  [median] np.median: {time.perf_counter()-t_med:.2f}s')
+    
         if self.bg_mode == 'concat':
-            median = Image.fromarray(median.astype('uint8'))
-            median = np.array(median.resize(size=(self.WIDTH, self.HEIGHT)))
             median = np.moveaxis(median, -1, 0)
-        print('Median image generated.')
+    
+        print(f'Median image generated. (total {time.perf_counter()-t_total:.2f}s)')
         return median
+
+
+
     
     def __process__(self, imgs):
-        """ Process the frame sequence. """
-        if self.bg_mode:
-            median_img = self.median
-        frames = np.array([]).reshape(0, self.HEIGHT, self.WIDTH)
-        for i in range(self.seq_len):
-            img = Image.fromarray(imgs[i])
-            if self.bg_mode == 'subtract':
-                img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = img.reshape(1, self.HEIGHT, self.WIDTH)
-            elif self.bg_mode == 'subtract_concat':
-                diff_img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = np.moveaxis(img, -1, 0)
-                img = np.concatenate((img, diff_img), axis=0)
-            else:
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = np.moveaxis(img, -1, 0)
-            
-            frames = np.concatenate((frames, img), axis=0)
-        
-        if self.bg_mode == 'concat':
-            frames = np.concatenate((median_img, frames), axis=0)
-        
-        # Normalization
-        frames /= 255.
-        return frames
+        """Process the frame sequence — vectorised rewrite (concat mode optimised)."""
 
-        
+        # ── 1. 批次 resize：一次處理所有幀，避免 PIL 逐幀迴圈 ──────────
+        # imgs: (seq_len, H_orig, W_orig, 3)  uint8
+        resized = np.empty((self.seq_len, self.HEIGHT, self.WIDTH, 3), dtype=np.uint8)
+        for i in range(self.seq_len):
+            # cv2.resize 比 PIL.resize 快約 3-5x
+            resized[i] = cv2.resize(imgs[i], (self.WIDTH, self.HEIGHT),
+                                    interpolation=cv2.INTER_LINEAR)
+        # resized: (seq_len, H, W, 3)
+
+        if not self.bg_mode:
+            # ── 純 RGB，moveaxis 後展平 ────────────────────────────────
+            # (seq_len, H, W, 3) → (seq_len, 3, H, W) → (seq_len*3, H, W)
+            frames = np.ascontiguousarray(
+                resized.transpose(0, 3, 1, 2).reshape(-1, self.HEIGHT, self.WIDTH)
+            )
+
+        elif self.bg_mode == 'subtract':
+            # ── 每幀與 median 相減，取絕對值後灰階 ────────────────────
+            # median shape 應為 (H, W, 3) 或 (3, H, W)
+            median = self._get_median_hwc()          # → (H, W, 3)
+            diff = np.abs(resized.astype(np.int16) - median.astype(np.int16))
+            diff = diff.sum(axis=3).astype(np.uint8) # (seq_len, H, W)
+            frames = diff[:, np.newaxis, :, :]       # (seq_len, 1, H, W)
+            frames = frames.reshape(-1, self.HEIGHT, self.WIDTH).astype(np.float32)
+
+        elif self.bg_mode == 'subtract_concat':
+            median = self._get_median_hwc()          # (H, W, 3)
+            diff = np.abs(resized.astype(np.int16) - median.astype(np.int16))
+            diff = diff.sum(axis=3).astype(np.uint8) # (seq_len, H, W)
+            rgb  = resized.transpose(0, 3, 1, 2)     # (seq_len, 3, H, W)
+            diff = diff[:, np.newaxis, :, :]         # (seq_len, 1, H, W)
+            # 每幀：4 channels (R,G,B,diff)
+            frames = np.concatenate([rgb, diff], axis=1)  # (seq_len, 4, H, W)
+            frames = frames.reshape(-1, self.HEIGHT, self.WIDTH).astype(np.float32)
+
+        else:  # 'concat'
+            # ── RGB 幀 + median 前置 ────────────────────────────────────
+            rgb = resized.transpose(0, 3, 1, 2)      # (seq_len, 3, H, W)
+            frames = rgb.reshape(-1, self.HEIGHT, self.WIDTH)  # (seq_len*3, H, W)
+
+            # median 已經是 (3, H, W) float，直接前置
+            median = self._get_median_chw()          # (3, H, W)
+            frames = np.concatenate([median, frames], axis=0)  # (3+seq_len*3, H, W)
+
+        # ── 2. Normalization ────────────────────────────────────────────
+        return frames.astype(np.float32) / 255.
+
+
+    def _get_median_hwc(self):
+        """median を (H, W, 3) uint8 で返す（形式を統一）"""
+        m = self.median  # 現在の形式に依存
+        if m.shape[0] == 3:          # (3, H, W) → (H, W, 3)
+            m = m.transpose(1, 2, 0)
+        return m.astype(np.uint8)
+
+    def _get_median_chw(self):
+        """median を (3, H, W) float32 で返す"""
+        m = self.median
+        if m.ndim == 3 and m.shape[2] == 3:  # (H, W, 3) → (3, H, W)
+            m = m.transpose(2, 0, 1)
+        return m.astype(np.float32)
+
+
+
+
+# 貼在 dataset.py 最底部，測完刪掉即可
+if __name__ == '__main__':
+    import time
+    import numpy as np
+
+    VIDEO = '048/C0050.mp4'   # ← 改成你的影片路徑
+    N_BATCHES = 10
+
+    dataset = Video_IterableDataset(
+        VIDEO, seq_len=8, sliding_step=1, bg_mode='concat'
+    )
+    
+    # 先印 median shape，確認轉換正確
+    print(f"median shape: {dataset.median.shape}, dtype: {dataset.median.dtype}")
+
+    times = []
+    for i, (idx, x) in enumerate(dataset):
+        if i == 0:
+            t0 = time.perf_counter()   # 跳過第一個（median init）
+        if i >= N_BATCHES:
+            break
+        t1 = time.perf_counter()
+        _ = x
+        times.append(time.perf_counter() - t1)
+
+    print(f"平均 __process__ 耗時: {np.mean(times)*1000:.1f} ms")
+    print(f"吞吐量: {8 / np.mean(times):.1f} frames/sec")

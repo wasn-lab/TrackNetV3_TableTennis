@@ -10,6 +10,8 @@ import pandas as pd
 from collections import deque
 from PIL import Image, ImageDraw
 from model import TrackNet, InpaintNet
+import subprocess
+
 
 # Global variables
 HEIGHT = 288
@@ -19,6 +21,86 @@ DELTA_T = 1/math.sqrt(HEIGHT**2 + WIDTH**2)
 COOR_TH = DELTA_T * 50
 IMG_FORMAT = 'jpg'
 
+class FFmpegWriter:
+    """
+    用 ffmpeg subprocess 做硬體/軟體編碼，介面相容 cv2.VideoWriter。
+    吃 BGR uint8 ndarray，輸出 mp4。
+
+    codec:
+        'h264_nvenc' : NVIDIA GPU 硬編（最快，需要 NVENC 支援）
+        'libx264'    : CPU 軟編（相容性最佳）
+    """
+    def __init__(self, save_file, width, height, fps,
+                 codec='h264_nvenc', preset=None, cq=23):
+        self.save_file = save_file
+        self.width = int(width)
+        self.height = int(height)
+        self.closed = False
+
+        common_in = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{self.width}x{self.height}',
+            '-r', f'{fps}',
+            '-i', '-',
+            '-an',
+        ]
+        common_out = [
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            save_file,
+        ]
+
+        if codec == 'h264_nvenc':
+            preset = preset or 'p4'   # p1(最快) ~ p7(品質最好)
+            enc = ['-c:v', 'h264_nvenc', '-preset', preset, '-cq', str(cq)]
+        elif codec == 'libx264':
+            preset = preset or 'veryfast'
+            enc = ['-c:v', 'libx264', '-preset', preset, '-crf', str(cq)]
+        else:
+            raise ValueError(f'Unsupported codec: {codec}')
+
+        cmd = common_in + enc + common_out
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def write(self, frame_bgr):
+        if frame_bgr.shape[0] != self.height or frame_bgr.shape[1] != self.width:
+            frame_bgr = cv2.resize(frame_bgr, (self.width, self.height))
+        if frame_bgr.dtype != np.uint8:
+            frame_bgr = frame_bgr.astype(np.uint8)
+        if not frame_bgr.flags['C_CONTIGUOUS']:
+            frame_bgr = np.ascontiguousarray(frame_bgr)
+        try:
+            self.proc.stdin.write(frame_bgr.tobytes())
+        except BrokenPipeError:
+            err = self.proc.stderr.read().decode('utf-8', errors='ignore')
+            raise RuntimeError(f'ffmpeg pipe broken:\n{err}')
+
+    def release(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            ret = self.proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            ret = -1
+        if ret != 0:
+            err = self.proc.stderr.read().decode('utf-8', errors='ignore')
+            print(f'[FFmpegWriter] ffmpeg exit={ret}\n{err}')
+
+    def isOpened(self):
+        return not self.closed and self.proc.poll() is None
 
 class ResumeArgumentParser():
     """ A argument parser for parsing the parameter dictionary from checkpoint file."""
@@ -224,65 +306,76 @@ def generate_frames(video_file):
             
     return frame_list
 
+_COLOR_MAP = {
+    'red':    (0, 0, 255),
+    'yellow': (0, 255, 255),
+    'green':  (0, 255, 0),
+    'blue':   (255, 0, 0),
+    'white':  (255, 255, 255),
+    'black':  (0, 0, 0),
+}
 def draw_traj(img, traj, radius=3, color='red'):
-    """ Draw trajectory on the image.
-
-        Args:
-            img (numpy.ndarray): Image with shape (H, W, C)
-            traj (deque): Trajectory to draw
-
-        Returns:
-            img (numpy.ndarray): Image with trajectory drawn
+    """Draw trajectory on the image (in-place, OpenCV only).
+    Args:
+        img (numpy.ndarray): BGR image with shape (H, W, 3), uint8
+        traj (deque): Trajectory points, each item is [x, y] or None
+        radius (int): Circle radius
+        color (str): Outline color name
+    Returns:
+        img (numpy.ndarray): Same array, drawn in-place
     """
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)   
-    img = Image.fromarray(img)
-    
-    for i in range(len(traj)):
-        if traj[i] is not None:
-            draw_x = traj[i][0]
-            draw_y = traj[i][1]
-            bbox =  (draw_x - radius, draw_y - radius, draw_x + radius, draw_y + radius)
-            draw = ImageDraw.Draw(img)
-            draw.ellipse(bbox, fill='rgb(255,255,255)', outline=color)
-            del draw
-    img =  cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
+    outline_bgr = _COLOR_MAP.get(color, (0, 0, 255))
+    fill_bgr = (255, 255, 255)  # white
+    for p in traj:
+        if p is None:
+            continue
+        x, y = int(p[0]), int(p[1])
+        # 先畫白色實心填充
+        cv2.circle(img, (x, y), radius, fill_bgr, thickness=-1, lineType=cv2.LINE_AA)
+        # 再畫彩色外框
+        cv2.circle(img, (x, y), radius, outline_bgr, thickness=1, lineType=cv2.LINE_AA)
     return img
 
-def write_pred_video(video_file, pred_dict, save_file, traj_len=8, label_df=None):
+def write_pred_video(video_file, pred_dict, save_file, traj_len=8,
+                     label_df=None, codec='h264_nvenc'):
     # Read video
     cap = cv2.VideoCapture(video_file)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    w, h = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    fps = cap.get(cv2.CAP_PROP_FPS)   # ⚠️ 不要 int()，保留 float
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Read ground truth label if exists
+    # Ground truth (若有)
     if label_df is not None:
         f_i, x, y, vis = label_df['Frame'], label_df['X'], label_df['Y'], label_df['Visibility']
 
-    # Read prediction result
+    # Prediction
     x_pred, y_pred, vis_pred = pred_dict['X'], pred_dict['Y'], pred_dict['Visibility']
 
-    # Video config (force MP4)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(save_file, fourcc, fps, (w, h))
+    # 🚀 用 FFmpegWriter；失敗則 fallback 到 libx264
+    try:
+        out = FFmpegWriter(save_file, w, h, fps, codec=codec)
+        used_codec = codec
+    except Exception as e:
+        print(f'[write_pred_video] {codec} init failed ({e}), fallback to libx264')
+        out = FFmpegWriter(save_file, w, h, fps, codec='libx264')
+        used_codec = 'libx264'
 
-    if not out.isOpened():
-        raise RuntimeError(
-            f"Failed to open VideoWriter for mp4. "
-            f"Check OpenCV build / ffmpeg support. save_file={save_file}"
-        )
+    print(f'FFmpegWriter opened: codec={used_codec}, {w}x{h}@{fps:.2f}fps, save={save_file}')
 
-    print("VideoWriter opened:", out.isOpened(), "save_file:", save_file)
-
-    # Create a queue for storing trajectory
+    # Trajectory queues
     pred_queue = deque()
     if label_df is not None:
         gt_queue = deque()
 
+    n_pred = len(x_pred)
     i = 0
     while True:
         success, frame = cap.read()
         if not success:
+            break
+
+        # 預測資料已用完就停止（避免 index out of range）
+        if i >= n_pred:
             break
 
         # Check capacity of queue
@@ -293,8 +386,15 @@ def write_pred_video(video_file, pred_dict, save_file, traj_len=8, label_df=None
 
         # Push ball coordinates for each frame
         if label_df is not None:
-            gt_queue.appendleft([x[i], y[i]]) if vis[i] and i < len(label_df) else gt_queue.appendleft(None)
-        pred_queue.appendleft([x_pred[i], y_pred[i]]) if vis_pred[i] else pred_queue.appendleft(None)
+            if i < len(label_df) and vis[i]:
+                gt_queue.appendleft([x[i], y[i]])
+            else:
+                gt_queue.appendleft(None)
+
+        if vis_pred[i]:
+            pred_queue.appendleft([x_pred[i], y_pred[i]])
+        else:
+            pred_queue.appendleft(None)
 
         # Draw ground truth trajectory if exists
         if label_df is not None:
@@ -303,13 +403,14 @@ def write_pred_video(video_file, pred_dict, save_file, traj_len=8, label_df=None
         # Draw prediction trajectory (history) in yellow
         frame = draw_traj(frame, pred_queue, color='yellow')
 
-        # Draw current frame point in red (override on top)
+        # Current frame point in red
         if len(pred_queue) > 0 and pred_queue[0] is not None:
-            cx, cy = pred_queue[0]  # appendleft → index 0 is newest/current
-            cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)  # BGR red
+            cx, cy = pred_queue[0]
+            cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
 
-        # Draw frame index
-        cv2.putText(frame, f"Frame: {i}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+        # Frame index
+        cv2.putText(frame, f"Frame: {i}", (30, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
 
         out.write(frame)
         i += 1
