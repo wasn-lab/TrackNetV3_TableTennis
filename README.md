@@ -39,7 +39,7 @@ conda activate tracknetV3
 - Install the requirements.
 ```bash
 pip install -r requirements.txt
-pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
 
 - Auto Run Scripts
