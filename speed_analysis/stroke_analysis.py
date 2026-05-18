@@ -328,13 +328,31 @@ def detect_strokes_from_runs(
                             stroke_len = frame_end - frame_start + 1
 
                 end_x = float(df.iloc[stroke_end_idx]["X"])
+                start_x = float(df.iloc[frame_start_idx]["X"])
 
-                # Short no_hit rows are only kept when they really end on the
-                # left side. This avoids exporting short right-side noise.
-                if stroke_len < min_candidate_frames and end_x > frame_w * left_half_ratio:
-                    search_idx = stroke_end_idx + 1
-                    continue
+                # --------------------------------------------------
+                # 過濾不是真正 stroke 的 no_hit 片段
+                #
+                # has_hit=False 的情況，只有「真的一路往左飛出畫面」才保留成 no_hit。
+                # 像 C0078 stroke10 這種是合理 no_hit：
+                #   start_x 很右、end_x 很左、整體往左位移很大
+                #
+                # 像 C0078 stroke17 / stroke28 這種只是慢速殘段或追蹤片段：
+                #   不是完整一球、沒有明顯從右側飛到左側
+                #   就不要 append 成 stroke。
+                # --------------------------------------------------
+                if not has_hit:
+                    total_left_dx = start_x - end_x
 
+                    # no_hit 必須真的飛到很左邊
+                    no_hit_end_left = end_x <= frame_w * 0.12
+
+                    # no_hit 必須有足夠大的整體左向位移
+                    no_hit_large_left_motion = total_left_dx >= frame_w * 0.45
+
+                    if not (no_hit_end_left and no_hit_large_left_motion):
+                        search_idx = stroke_end_idx + 1
+                        continue
 
                 strokes.append(make_stroke(
                     stroke_id=stroke_id,

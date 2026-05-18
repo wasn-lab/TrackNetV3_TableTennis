@@ -128,11 +128,13 @@ def plot_one_csv(
 
         correct_list = []
 
-        for shot_order, (_, row) in enumerate(plot_df.iterrows(), start=1):
+        for _, row in plot_df.iterrows():
             if row["has_landing"]:
+                stroke_id = int(row["stroke_id"])
+
                 correct = is_correct_target(
                     row_num=row["row_num"],
-                    landing_order=shot_order,
+                    landing_order=stroke_id,
                     target_mode=target_mode,
                 )
                 correct_list.append(correct)
