@@ -29,6 +29,7 @@ GRID_ROWS = 4
 DPI = 150
 
 OUT_DIR = "runs/"
+CURRENT_BASE_NAME = None
 
 # Table projection tolerance. Projection is not used as true 3D height; it is
 # only used to keep points close to the table and to compute landing coordinates.
@@ -112,6 +113,12 @@ REQUIRED_TABLE_COLS = [
     "table_p3_x", "table_p3_y",
     "table_p4_x", "table_p4_y",
 ]
+
+
+def _output_path(filename: str) -> str:
+    if CURRENT_BASE_NAME:
+        return os.path.join(OUT_DIR, f"{CURRENT_BASE_NAME}_{filename}")
+    return os.path.join(OUT_DIR, filename)
 
 
 def has_valid_table(row) -> bool:
@@ -820,6 +827,7 @@ def compute_landings_with_bounce(
     strokes: pd.DataFrame,
     traj: pd.DataFrame,
     save_dir: str = None,
+    base_name: str = None,
     table_margin_x_cm: float = TABLE_MARGIN_X_CM,
     table_margin_y_cm: float = TABLE_MARGIN_Y_CM,
     min_bounce_score: float = None,
@@ -830,7 +838,8 @@ def compute_landings_with_bounce(
     Compute landing information and bounce_frame for each stroke.
     Returns one row per stroke with a detected table-near bounce.
     """
-    global OUT_DIR
+    global OUT_DIR, CURRENT_BASE_NAME
+    CURRENT_BASE_NAME = base_name
     if save_dir is not None:
         OUT_DIR = save_dir
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -872,6 +881,9 @@ def compute_landings_with_bounce(
         records.append(result)
 
     df_land = pd.DataFrame(records)
+    if not df_land.empty and base_name:
+        df_land.insert(0, "video_name", base_name)
+
     side_msg = "right-half only" if right_half_only else "all table"
     print(
         f"[landing] detected bounce: {len(df_land)} strokes ({side_msg}), "
@@ -927,7 +939,7 @@ def plot_heatmap(df):
     ax.set_title(f"heatmap({GRID_COLS}×{GRID_ROWS})\n{int(df['in_table'].sum())} ball on table", fontsize=13)
     ax.legend(loc="upper right", fontsize=9)
 
-    out = os.path.join(OUT_DIR, "landing_heatmap.png")
+    out = _output_path("landing_heatmap.png")
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[儲存] {out}")
@@ -962,7 +974,7 @@ def plot_scatter(df):
     ax.set_title("landing scatter", fontsize=13)
     ax.legend(loc="best", fontsize=9)
 
-    out = os.path.join(OUT_DIR, "landing_zones.png")
+    out = _output_path("landing_zones.png")
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[儲存] {out}")
@@ -970,7 +982,7 @@ def plot_scatter(df):
 
 def save_stats(df):
     os.makedirs(OUT_DIR, exist_ok=True)
-    detail_path = os.path.join(OUT_DIR, "landing_detail.csv")
+    detail_path = _output_path("landing_detail.csv")
     df.to_csv(detail_path, index=False, encoding="utf-8-sig")
     print(f"[儲存] {detail_path}")
 
@@ -981,6 +993,9 @@ def save_stats(df):
         .reset_index(name="count")
         .sort_values("zone_label")
     )
-    stats_path = os.path.join(OUT_DIR, "zone_stats.csv")
+    if CURRENT_BASE_NAME:
+        stats.insert(0, "video_name", CURRENT_BASE_NAME)
+
+    stats_path = _output_path("zone_stats.csv")
     stats.to_csv(stats_path, index=False, encoding="utf-8-sig")
     print(f"[儲存] {stats_path}")

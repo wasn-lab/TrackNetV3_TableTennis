@@ -21,6 +21,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
+def _series_to_bool(series: pd.Series) -> pd.Series:
+    return series.fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "1.0", "yes", "y"])
+
+
 def get_row_from_zone(zone_label):
     """
     Example:
@@ -124,7 +128,7 @@ def plot_one_csv(
 
         # 如果有 in_table，就再要求 in_table == True
         if "in_table" in plot_df.columns:
-            plot_df["has_landing"] = plot_df["has_landing"] & (plot_df["in_table"].astype(str) == "True")
+            plot_df["has_landing"] = plot_df["has_landing"] & _series_to_bool(plot_df["in_table"])
 
         correct_list = []
 
@@ -159,10 +163,29 @@ def plot_one_csv(
 
         accuracy = eval_correct / eval_total * 100 if eval_total > 0 else 0
         in_rate = eval_in_table / eval_total * 100 if eval_total > 0 else 0
+    else:
+        eval_df = plot_df[
+            (plot_df["stroke_id"] >= 2) &
+            (plot_df["stroke_id"] <= 26)
+        ].copy()
+        eval_total = len(eval_df)
+        eval_correct = 0
+        eval_in_table = 0
+        eval_wrong_landing = 0
+        accuracy = 0
+        in_rate = 0
 
-    mean_val = plot_df[speed_col].mean()
-    max_val = plot_df[speed_col].max()
-    median_val = plot_df[speed_col].median()
+    # Mean / Max / Median 只用紅點，也就是 eval strokes 2~26 裡 correct_target=True 的球。
+    # 這樣藍點不會進入 max，右邊統計框會和紅點一致。
+    stat_df = eval_df[eval_df["correct_target"]].copy()
+    if stat_df.empty:
+        mean_val = float("nan")
+        max_val = float("nan")
+        median_val = float("nan")
+    else:
+        mean_val = stat_df[speed_col].mean()
+        max_val = stat_df[speed_col].max()
+        median_val = stat_df[speed_col].median()
 
     correct_count = int(plot_df["correct_target"].sum())
     landing_count = int(plot_df["has_landing"].sum())
@@ -245,6 +268,7 @@ def plot_one_csv(
         f"Mean: {mean_val:.2f} km/h\n"
         f"Max: {max_val:.2f} km/h\n"
         f"Median: {median_val:.2f} km/h\n"
+        f"Stat source: correct red points\n"
         f"Target: {target_mode}\n"
         f"Eval strokes: 2-26\n"
         f"Total: {eval_total}\n"

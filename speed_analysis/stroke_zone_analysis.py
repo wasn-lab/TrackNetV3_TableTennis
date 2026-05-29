@@ -36,7 +36,8 @@ from helper_table import BOX_EDGES, BOX_HEIGHT, NEAR_NET_DIST, NearNetRegion, lo
 
 TABLE_W = 274.0
 TABLE_H = 152.5
-MAX_SPEED_KMH = 150.0
+MAX_SPEED_KMH = 130.0
+SPEED_GT_SCALE_FACTOR = 0.8
 
 # Height correction before local table-width scale lookup.
 # Positive value means the observed ball center is moved toward the near side
@@ -54,8 +55,8 @@ DRAW_SPEED_SCALE_DEBUG = True
 # the same image segment on z=0 and z=h parallel planes. The resulting ratio
 # is used to scale the current y-based speed, instead of directly guessing a
 # global multiplier.
-DEFAULT_PLANE_HEIGHT_CM = 25.0
-DEFAULT_CAMERA_FOCAL_SCALE = 0.8
+DEFAULT_PLANE_HEIGHT_CM = 26.0
+DEFAULT_CAMERA_FOCAL_SCALE = 1.0
 DEFAULT_PLANE_DEBUG_MAX_HEIGHT_CM = 50.0
 
 TABLE_WORLD_CORNERS = np.array([
@@ -1053,7 +1054,7 @@ def save_orange_rectified_debug(save_path, orange_corners, speed_start_xy, speed
 
     # Draw table boundary and coarse real-world grid.
     cv2.rectangle(canvas, (0, 0), (rect_w - 1, rect_h - 1), (0, 165, 255), 2, cv2.LINE_AA)
-    grid_cm = 25.0
+    grid_cm = 26.0
     for x_cm in np.arange(grid_cm, TABLE_W, grid_cm):
         x_px = int(round(x_cm * ORANGE_RECT_SCALE_PX_PER_CM))
         cv2.line(canvas, (x_px, 0), (x_px, rect_h - 1), (220, 220, 220), 1, cv2.LINE_AA)
@@ -1168,9 +1169,25 @@ def compute_blue_orange_mixed_scale_info(table_corners, orange_corners, x1, y1, 
     blue_sy_probe_rect_px = float(np.linalg.norm(probe_rect - mid_rect))
 
     blue_original_table_height_px = compute_average_table_height_px(blue)
-    blue_rectified_table_height_px = float(get_orange_rect_size_px()[1])
     if blue_original_table_height_px is None or blue_original_table_height_px < 1e-6:
         return None
+
+    # Depth compensation should not depend on the debug image scale
+    # (ORANGE_RECT_SCALE_PX_PER_CM), and should not follow every local_y jitter.
+    # Use the average of far/back and near/front table widths as a fixed
+    # rectified-plane pixel scale.
+    # p1->p2 is the far/back edge; p4->p3 is the near/front edge.
+    p1_b, p2_b, p3_b, p4_b = blue[:4]
+    far_width_px = calc_step(p1_b[0], p1_b[1], p2_b[0], p2_b[1])
+    near_width_px = calc_step(p4_b[0], p4_b[1], p3_b[0], p3_b[1])
+    avg_width_px = float((far_width_px + near_width_px) / 2.0)
+    if avg_width_px < 1e-6:
+        return None
+
+    # avg_width_px corresponds to TABLE_W cm, so it defines a stable px/cm
+    # scale for the rectified table height.
+    avg_px_per_cm = float(avg_width_px / TABLE_W)
+    blue_rectified_table_height_px = float(TABLE_H * avg_px_per_cm)
     blue_depth_ratio = float(blue_rectified_table_height_px / blue_original_table_height_px)
 
     return {
@@ -1242,7 +1259,7 @@ def save_blue_rectified_sy_debug(save_path, table_corners, speed_start_xy, speed
     canvas = np.full((rect_h, rect_w, 3), 255, dtype=np.uint8)
 
     cv2.rectangle(canvas, (0, 0), (rect_w - 1, rect_h - 1), (255, 255, 0), 2, cv2.LINE_AA)
-    grid_cm = 25.0
+    grid_cm = 26.0
     for x_cm in np.arange(grid_cm, TABLE_W, grid_cm):
         x_px = int(round(x_cm * ORANGE_RECT_SCALE_PX_PER_CM))
         cv2.line(canvas, (x_px, 0), (x_px, rect_h - 1), (220, 220, 220), 1, cv2.LINE_AA)
@@ -1266,8 +1283,8 @@ def save_blue_rectified_sy_debug(save_path, table_corners, speed_start_xy, speed
         f'blue rectified table: {rect_w}x{rect_h}px ({ORANGE_RECT_SCALE_PX_PER_CM:.1f}px/cm)',
         f'red rect dx={info["blue_rect_dx_px"]:.1f}px, dy={info["blue_rect_dy_px"]:.1f}px, dist={info["blue_rect_dist_px"]:.1f}px',
         f'red cm dx={info["blue_homography_dx_cm"]:.2f}, dy={info["blue_homography_dy_cm"]:.2f}, dist={info["blue_homography_dist_cm"]:.2f}',
-        f'height ratio = rect_h / original_h = {info["blue_rectified_table_height_px"]:.1f} / {info["blue_original_table_height_px"]:.1f} = {info["blue_depth_ratio"]:.4f}',
-        f'sy_final = sy_blue * depth_ratio; probe sy only for reference = {info["blue_sy_probe_cm_per_px"]:.4f}',
+        f'depth ratio = avg_width_rect_h / original_h = {info["blue_rectified_table_height_px"]:.1f} / {info["blue_original_table_height_px"]:.1f} = {info["blue_depth_ratio"]:.4f}',
+        f'sx_final = sx_blue * ratio_x; sy_final = sy_blue * depth_ratio; probe sy reference = {info["blue_sy_probe_cm_per_px"]:.4f}',
     ]
     x_text, y_text = 20, 35
     for line in lines:
@@ -1482,6 +1499,13 @@ def make_speed_segment(
             if np.isfinite(speed_plane):
                 speed_selected = float(speed_plane)
                 plane_scale_ratio = float(speed_selected / speed_table) if speed_table > 1e-8 else None
+
+    # Final GT-based calibration scale.
+    # The current setup is scaled by 0.75 from GT comparison (30 / 40).
+    speed_table = float(speed_table) * SPEED_GT_SCALE_FACTOR
+    if speed_plane is not None:
+        speed_plane = float(speed_plane) * SPEED_GT_SCALE_FACTOR
+    speed_selected = float(speed_selected) * SPEED_GT_SCALE_FACTOR
 
     if not np.isfinite(speed_selected) or speed_selected > MAX_SPEED_KMH:
         return None
@@ -2411,6 +2435,50 @@ def build_export_speed_detail_csv(summary_df_full: pd.DataFrame) -> pd.DataFrame
     return keep_columns(summary_df_full, keep_cols)
 
 
+
+def _series_to_bool(series: pd.Series) -> pd.Series:
+    """Convert mixed bool/string/number columns to bool safely."""
+    return series.fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
+
+
+def get_table_hit_speed_df_for_analysis(summary_df_full: pd.DataFrame, speed_col: str = "net_zone_max_speed_kmh") -> pd.DataFrame:
+    """Return only table-hit rows for final mean/max speed analysis.
+
+    This does not change/export/filter the original summary_df_full.
+    Use this only at the final statistics step, so stroke_zone, landing_detail,
+    zone_detail, and speed_detail still keep all strokes.
+    """
+    if summary_df_full is None or summary_df_full.empty:
+        return pd.DataFrame()
+
+    if "in_table" not in summary_df_full.columns or speed_col not in summary_df_full.columns:
+        return pd.DataFrame()
+
+    out = summary_df_full[_series_to_bool(summary_df_full["in_table"])].copy()
+    out[speed_col] = pd.to_numeric(out[speed_col], errors="coerce")
+    out = out.dropna(subset=[speed_col])
+    return out
+
+
+def compute_table_hit_speed_mean_max(summary_df_full: pd.DataFrame, speed_col: str = "net_zone_max_speed_kmh") -> Dict:
+    """Compute final mean/max speed using only balls that landed on the table."""
+    speed_df = get_table_hit_speed_df_for_analysis(summary_df_full, speed_col=speed_col)
+    if speed_df.empty:
+        return {
+            "table_hit_speed_count": 0,
+            "mean_speed_kmh": None,
+            "max_speed_kmh": None,
+            "max_speed_stroke_id": None,
+        }
+
+    max_idx = speed_df[speed_col].idxmax()
+    return {
+        "table_hit_speed_count": int(len(speed_df)),
+        "mean_speed_kmh": float(speed_df[speed_col].mean()),
+        "max_speed_kmh": float(speed_df.loc[max_idx, speed_col]),
+        "max_speed_stroke_id": int(speed_df.loc[max_idx, "stroke_id"]) if "stroke_id" in speed_df.columns else None,
+    }
+
 def keep_columns(df: pd.DataFrame, keep_cols: List[str]) -> pd.DataFrame:
     out = df.copy()
     for col in keep_cols:
@@ -2606,19 +2674,31 @@ def process_single_video(
             use_height_plane_scale=bool(use_height_plane_scale and camera_model is not None),
         )
 
+        base = os.path.splitext(os.path.basename(video_file))[0] if has_video else strip_csv_suffix(ball_csv)
+
         # Landing module detects bounce_frame with the current piecewise trajectory method.
-        # It writes landing_detail.csv, landing_heatmap.png, landing_zones.png, and zone_stats.csv.
+        # It writes <base>_landing_detail.csv, <base>_landing_heatmap.png,
+        # <base>_landing_zones.png, and <base>_zone_stats.csv.
         landing_input_df = summary_df_full.copy()
         if "note" in landing_input_df.columns:
             landing_input_df = landing_input_df[
                 ~landing_input_df["note"].fillna("").astype(str).str.split(";").apply(lambda parts: "no_hit" in parts)
             ].copy()
 
-        df_land = landing.compute_landings_with_bounce(landing_input_df, df, save_dir=save_dir)
+        df_land = landing.compute_landings_with_bounce(
+            landing_input_df,
+            df,
+            save_dir=save_dir,
+            base_name=base,
+        )
         summary_df_full = merge_landing_results(summary_df_full, df_land)
         sync_bounce_frames_to_strokes(strokes, summary_df_full)
 
-        base = os.path.splitext(os.path.basename(video_file))[0] if has_video else strip_csv_suffix(ball_csv)
+        # Keep all rows in every normal output.
+        # If a later final analysis needs mean/max speed, use
+        # compute_table_hit_speed_mean_max(summary_df_full) so only in_table=True
+        # rows are included at calculation time.
+
         csv_path = os.path.join(save_dir, f"{base}_stroke_zone.csv")
         zone_detail_csv_path = os.path.join(save_dir, f"{base}_zone_detail.csv")
         speed_detail_csv_path = os.path.join(save_dir, f"{base}_net_zone_speed_detail.csv")
@@ -2637,6 +2717,17 @@ def process_single_video(
             print("[WARN] --save_video was set, but no mp4 was found. Skip visual video output.")
     finally:
         frame_reader.release()
+
+    table_hit_speed_stats = compute_table_hit_speed_mean_max(summary_df_full)
+    print(f"table-hit speed count : {table_hit_speed_stats['table_hit_speed_count']}")
+    if table_hit_speed_stats["mean_speed_kmh"] is None:
+        print("table-hit mean speed  : N/A")
+        print("table-hit max speed   : N/A")
+        print("table-hit max stroke  : N/A")
+    else:
+        print(f"table-hit mean speed  : {table_hit_speed_stats['mean_speed_kmh']:.2f} km/h")
+        print(f"table-hit max speed   : {table_hit_speed_stats['max_speed_kmh']:.2f} km/h")
+        print(f"table-hit max stroke  : {table_hit_speed_stats['max_speed_stroke_id']}")
 
     print(f"saved csv   : {csv_path}")
     print(f"saved zone  : {zone_detail_csv_path}")
