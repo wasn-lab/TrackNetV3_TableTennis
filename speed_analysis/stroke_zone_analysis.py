@@ -37,7 +37,7 @@ from helper_table import BOX_EDGES, BOX_HEIGHT, NEAR_NET_DIST, NearNetRegion, lo
 TABLE_W = 274.0
 TABLE_H = 152.5
 MAX_SPEED_KMH = 130.0
-SPEED_GT_SCALE_FACTOR = 0.8
+SPEED_GT_SCALE_FACTOR = 0.75
 
 # Height correction before local table-width scale lookup.
 # Positive value means the observed ball center is moved toward the near side
