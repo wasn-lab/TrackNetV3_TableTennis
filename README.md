@@ -36,13 +36,15 @@ plot_speed_bounce.py 或 plot_speed.py
 ### Clone repository
 
 ```bash
-git clone https://github.com/wasn-lab/TrackNetV3_TableTennis.git && cd TrackNetV3_TableTennis
+git clone https://github.com/wasn-lab/TrackNetV3_TableTennis.git 
+cd TrackNetV3_TableTennis
 ```
 
 ### 建立 conda 環境
 
 ```bash
-conda create -n tracknetV3 python=3.11 && conda activate tracknetV3
+conda create -n tracknetV3 python=3.11 
+conda activate tracknetV3
 ```
 
 ### 安裝套件
